@@ -1,0 +1,16 @@
+Package: vroom
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: vroom maintainers <maintainer@example.invalid>
+Section: admin
+Priority: optional
+Depends: libc6, kmod, util-linux, e2fsprogs, systemd
+Recommends: libcuda1 | libnvidia-compute
+Description: use idle NVIDIA VRAM as swap or scratch disks
+ vroom allocates video memory on an otherwise unused NVIDIA GPU through the
+ driver's CUDA library and exposes it to the kernel as block devices (ublk
+ or NBD), usable as high-priority swap, a mounted scratch filesystem in
+ place of tmpfs, or a raw device.
+ .
+ Requires the proprietary NVIDIA driver (libcuda.so.1). Nothing is started
+ on installation; devices are created with vroomctl.

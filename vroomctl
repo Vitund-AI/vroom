@@ -1,0 +1,240 @@
+#!/bin/bash
+# vroomctl - manage VRAM-backed block devices.
+#   vroomctl add NAME [--size MiB] [--swap | --mount DIR | --raw] [options]
+#   vroomctl remove NAME            detach, release the VRAM, forget the device
+#   vroomctl stop NAME | start NAME keep the definition, release/reclaim the VRAM
+#   vroomctl list                   devices, state and usage
+#   vroomctl bench NAME             read-only 4K latency test of a live device
+#   vroomctl selftest [--size MiB]  integrity + speed test, no root needed
+# add options:
+#   --size MiB      device size (default: all free VRAM less 256 MiB)
+#   --swap          use as swap (default)      --prio N   swap priority (100)
+#   --mount DIR     format ext4 and mount      --mode OCT directory mode (1777)
+#   --raw           just the block device, at /dev/vroom/NAME
+#   --backend ublk|nbd   kernel interface (default: ublk when available)
+#   --gpu N         CUDA index of the GPU (0)
+#   --boot          also start at every boot
+# Contents never survive a stop or reboot. Definitions live in /etc/vroom/NAME.conf.
+set -euo pipefail
+
+CONF_DIR=/etc/vroom
+here=$(dirname "$(readlink -f "$0")")
+
+die() { echo "vroomctl: $*" >&2; exit 1; }
+need_root() { [ "$(id -u)" = 0 ] || die "this needs root (try sudo)"; }
+
+load() {
+	name=$1
+	[[ $name =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "bad name '$name' (use a-z, 0-9, - and _)"
+	[ -r "$CONF_DIR/$name.conf" ] || die "no such device: $name (see 'vroomctl list')"
+	VROOM_SIZE_MIB=0 VROOM_MODE=swap VROOM_PRIO=100 VROOM_MOUNT='' VROOM_MOUNT_MODE=1777
+	# shellcheck disable=SC1090
+	. "$CONF_DIR/$name.conf"
+	DEV=$VROOM_DEV
+	kname=$(basename "$DEV")
+	unit=vroom@$name.service
+}
+
+is_swap() { grep -q "^$DEV[[:space:]]" /proc/swaps; }
+is_mounted() { grep -q "^$DEV[[:space:]]" /proc/mounts; }
+ready() {
+	# The node can exist before the device can be opened, so really open it.
+	case "$kname" in nbd*) [ -e "/sys/block/$kname/pid" ] || return 1 ;; esac
+	[ "$(blockdev --getsize64 "$DEV" 2>/dev/null || echo 0)" != 0 ]
+}
+claimed() { grep -qsx "VROOM_DEV=$1" "$CONF_DIR"/*.conf; }
+
+pick_dev() {
+	local n
+	if [ "$1" = ublk ]; then
+		for n in $(seq 0 63); do
+			[ -e "/dev/ublkb$n" ] || claimed "/dev/ublkb$n" || { echo "/dev/ublkb$n"; return; }
+		done
+	else
+		modprobe nbd
+		for n in $(seq 0 63); do
+			[ -b "/dev/nbd$n" ] || break
+			[ -e "/sys/block/nbd$n/pid" ] || claimed "/dev/nbd$n" || { echo "/dev/nbd$n"; return; }
+		done
+	fi
+	die "no free $1 device"
+}
+
+# Take the device out of use. Fails, leaving everything intact, if it is busy.
+detach() {
+	case "$VROOM_MODE" in
+	# Explicit returns: 'set -e' does not apply inside 'detach || ...'.
+	swap) if is_swap; then swapoff "$DEV" || return 1; fi ;;
+	mount) if is_mounted; then umount "$DEV" || return 1; fi ;;
+	esac
+	rm -f "/dev/vroom/$name"
+}
+
+stop_device() {
+	if is_swap; then echo "swapoff $DEV: pages move back to RAM or other swap, this can take a while..."; fi
+	detach || die "$name is still in use; nothing was stopped"
+	systemctl stop "$unit"
+}
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case "$cmd" in
+add)
+	need_root
+	name=${1:-}
+	[[ $name =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "usage: vroomctl add NAME [options]; NAME uses a-z, 0-9, - and _"
+	shift
+	size=0 mode=swap prio=100 mnt='' mntmode=1777 backend='' gpu=0 boot=0
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--size) size=${2:?}; shift ;;
+		--swap) mode=swap ;;
+		--mount) mode=mount; mnt=${2:?}; shift ;;
+		--raw) mode=raw ;;
+		--prio) prio=${2:?}; shift ;;
+		--mode) mntmode=${2:?}; shift ;;
+		--backend) backend=${2:?}; shift ;;
+		--gpu) gpu=${2:?}; shift ;;
+		--boot) boot=1 ;;
+		*) die "unknown option: $1" ;;
+		esac
+		shift
+	done
+	[[ $size =~ ^[0-9]+$ && $prio =~ ^-?[0-9]+$ && $gpu =~ ^[0-9]+$ && $mntmode =~ ^[0-7]{3,4}$ ]] ||
+		die "--size, --prio and --gpu take numbers; --mode takes an octal mode"
+	if [ "$mode" = mount ]; then
+		[[ $mnt == /* && $mnt != *[[:space:]]* ]] || die "--mount needs an absolute path without spaces"
+		if [ -d "$mnt" ] && [ -n "$(ls -A "$mnt")" ]; then
+			echo "note: $mnt is not empty; its current contents are hidden while mounted"
+		fi
+	fi
+	[ -e "$CONF_DIR/$name.conf" ] && die "$name already exists (vroomctl remove $name)"
+	if [ -z "$backend" ]; then
+		if modinfo ublk_drv >/dev/null 2>&1; then backend=ublk; else backend=nbd; fi
+	fi
+	[ "$backend" = ublk ] || [ "$backend" = nbd ] || die "--backend must be ublk or nbd"
+
+	mkdir -p "$CONF_DIR"
+	conf=$CONF_DIR/$name.conf
+	{
+		echo "VROOM_DEV=$(pick_dev "$backend")"
+		echo "VROOM_SIZE_MIB=$size"
+		echo "VROOM_GPU=$gpu"
+		echo "VROOM_MODE=$mode"
+		[ "$mode" = swap ] && echo "VROOM_PRIO=$prio"
+		[ "$mode" = mount ] && printf 'VROOM_MOUNT=%s\nVROOM_MOUNT_MODE=%s\n' "$mnt" "$mntmode"
+	} > "$conf"
+	if ! systemctl start "vroom@$name.service"; then
+		journalctl -u "vroom@$name.service" -n 8 --no-pager -o cat >&2 || true
+		systemctl reset-failed "vroom@$name.service" 2>/dev/null || true
+		rm -f "$conf"
+		die "could not start $name; nothing was added"
+	fi
+	[ "$boot" = 1 ] && systemctl enable -q "vroom@$name.service"
+	exec "$0" list
+	;;
+remove)
+	need_root
+	load "${1:?usage: vroomctl remove NAME}"
+	stop_device
+	systemctl disable -q "$unit" 2>/dev/null || true
+	systemctl reset-failed "$unit" 2>/dev/null || true
+	rm -f "$CONF_DIR/$name.conf"
+	echo "$name removed"
+	;;
+stop)
+	need_root
+	load "${1:?usage: vroomctl stop NAME}"
+	stop_device
+	;;
+start)
+	need_root
+	load "${1:?usage: vroomctl start NAME}"
+	systemctl start "$unit"
+	;;
+list | status)
+	printf '%-12s %-9s %-13s %9s  %s\n' NAME STATE DEVICE SIZE USE
+	for f in "$CONF_DIR"/*.conf; do
+		[ -e "$f" ] || continue
+		load "$(basename "$f" .conf)"
+		state=$(systemctl is-active "$unit" 2>/dev/null || true)
+		size=- use=$VROOM_MODE
+		if [ -r "/sys/block/$kname/size" ] && [ "$state" = active ]; then
+			size="$(($(cat "/sys/block/$kname/size") / 2048)) MiB"
+		fi
+		case "$VROOM_MODE" in
+		swap)
+			use="swap, priority $VROOM_PRIO"
+			if is_swap; then
+				use="$use, $(awk -v d="$DEV" '$1 == d { printf "%.0f MiB used", $4 / 1024 }' /proc/swaps)"
+			fi
+			;;
+		mount)
+			use="mounted at $VROOM_MOUNT"
+			if is_mounted; then
+				use="$use, $(df -BM --output=used "$VROOM_MOUNT" | tail -1 | tr -d ' M') MiB used"
+			else
+				use="mount $VROOM_MOUNT (not mounted)"
+			fi
+			;;
+		raw) use="raw, /dev/vroom/$name" ;;
+		esac
+		printf '%-12s %-9s %-13s %9s  %s\n' "$name" "$state" "$DEV" "$size" "$use"
+	done
+	if command -v nvidia-smi >/dev/null; then
+		nvidia-smi --query-gpu=index,name,memory.used,memory.total --format=csv,noheader |
+			sed 's/^/GPU /'
+	fi
+	if grep -qs 'PreserveVideoMemoryAllocations: 0' /proc/driver/nvidia/params; then
+		echo "WARNING: the driver does not preserve VRAM across suspend; suspending destroys device contents"
+	fi
+	;;
+bench)
+	load "${1:?usage: vroomctl bench NAME}"
+	exec "$here/vroom" --bench "$DEV"
+	;;
+selftest)
+	exec "$here/vroom" --selftest "$@"
+	;;
+_prepare) # ExecStartPre: load the kernel side of the chosen backend
+	load "$1"
+	case "$kname" in
+	ublkb*) modprobe ublk_drv ;;
+	nbd*) modprobe nbd ;;
+	*) die "VROOM_DEV must be /dev/nbdN or /dev/ublkbN, not $DEV" ;;
+	esac
+	;;
+_attach) # ExecStartPost: the daemon is starting; wait for the device, then put it to use
+	load "$1"
+	for _ in $(seq 300); do
+		ready && break
+		[ -z "${MAINPID:-}" ] || [ -d "/proc/$MAINPID" ] || die "vroom daemon exited"
+		sleep 0.1
+	done
+	ready || die "$DEV did not come up"
+	mkdir -p /dev/vroom
+	ln -sfn "$DEV" "/dev/vroom/$name"
+	label=vroom-$name
+	case "$VROOM_MODE" in
+	swap)
+		mkswap -L "${label:0:15}" "$DEV" >/dev/null
+		swapon -p "$VROOM_PRIO" "$DEV"
+		;;
+	mount)
+		# Contents are volatile, so no journal and no reserved blocks.
+		mkfs.ext4 -q -F -m 0 -O ^has_journal -L "${label:0:16}" "$DEV"
+		mkdir -p "$VROOM_MOUNT"
+		mount -o noatime "$DEV" "$VROOM_MOUNT"
+		chmod "$VROOM_MOUNT_MODE" "$VROOM_MOUNT"
+		;;
+	esac
+	;;
+_detach) # ExecStop: must succeed before the daemon is asked to exit
+	load "$1"
+	detach
+	;;
+*)
+	sed -n '2,18p' "$0" >&2
+	exit 1
+	;;
+esac

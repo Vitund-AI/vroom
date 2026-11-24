@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+if [ -d /run/systemd/system ]; then
+	systemctl daemon-reload || true
+fi
+if [ "$1" = configure ] && [ -z "$2" ]; then
+	echo "vroom: installed. Try 'vroomctl selftest', then e.g."
+	echo "vroom:   vroomctl add swap --swap"
+	echo "vroom:   vroomctl add scratch --size 2048 --mount /mnt/scratch"
+fi
