@@ -3,6 +3,7 @@
 #   vroomctl add NAME [--size MiB] [--swap | --mount DIR | --raw] [options]
 #   vroomctl remove NAME            detach, release the VRAM, forget the device
 #   vroomctl stop NAME | start NAME keep the definition, release/reclaim the VRAM
+#                                   (after a driver upgrade, stop and remove want --force)
 #   vroomctl list                   devices, state and usage
 #   vroomctl bench NAME             read-only 4K latency test of a live device
 #   vroomctl stats [NAME]           I/O totals, and compression and repeat counts if on
@@ -18,6 +19,7 @@
 #   --ratio X       how much larger (1.5; 2.2 with --spill)
 #   --spill PATH    file or directory on a disk for what does not fit in the VRAM
 #   --spill-size MiB   size of that file (default: the size of the device)
+#   --cipher aes|chacha20   what a compressed device is encrypted with (aes)
 #   --boot          also start at every boot
 # Contents never survive a stop or reboot. Definitions live in /etc/vroom/NAME.conf.
 set -euo pipefail
@@ -27,6 +29,27 @@ here=$(dirname "$(readlink -f "$0")")
 
 die() { echo "vroomctl: $*" >&2; exit 1; }
 need_root() { [ "$(id -u)" = 0 ] || die "this needs root (try sudo)"; }
+
+# A driver upgrade replaces the libraries on disk but leaves the old kernel
+# module loaded until reboot. A running daemon keeps the libraries it started
+# with and carries on; a daemon started now would get the new ones, which the
+# old module refuses. So until reboot nothing can be started, and anything
+# stopped stays stopped.
+driver_mismatch() {
+	local lib
+	kver=$(awk 'NR == 1 { for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+\.[0-9.]+$/) { print $i; exit } }' \
+		"${VROOM_NV_PROC:-/proc/driver/nvidia/version}" 2>/dev/null) || true
+	lib=${VROOM_NV_LIB:-$(/sbin/ldconfig -p 2>/dev/null | awk '/libcuda\.so\.1 / { print $NF; exit }')}
+	lver=$(basename "$(readlink -f "${lib:-/nonexistent}")")
+	lver=${lver#libcuda.so.}
+	[[ -n $kver && $lver =~ ^[0-9] && $kver != "$lver" ]]
+}
+upgraded="the NVIDIA driver has been upgraded since boot"
+no_start() {
+	if driver_mismatch; then
+		die "$upgraded (libraries $lver, kernel module still $kver): nothing can be started until you reboot"
+	fi
+}
 
 load() {
 	name=$1
@@ -77,6 +100,11 @@ detach() {
 }
 
 stop_device() {
+	if [ "${1:-}" != --force ] && driver_mismatch; then
+		die "$upgraded (libraries $lver, kernel module still $kver).
+$name is running normally, but once stopped it cannot be started again until you reboot.
+To stop it all the same: vroomctl $cmd $name --force"
+	fi
 	if is_swap; then echo "swapoff $DEV: pages move back to RAM or other swap, this can take a while..."; fi
 	detach || die "$name is still in use; nothing was stopped"
 	systemctl stop "$unit"
@@ -91,7 +119,7 @@ add)
 	[[ $name =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "usage: vroomctl add NAME [options]; NAME uses a-z, 0-9, - and _"
 	shift
 	size=0 mode=swap prio=100 mnt='' mntmode=1777 backend='' gpu=0 boot=0
-	compress=0 ratio='' spill='' spillsize=0
+	compress=0 ratio='' spill='' spillsize=0 ciph=aes
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--size) size=${2:?}; shift ;;
@@ -107,6 +135,7 @@ add)
 		--ratio) compress=1; ratio=${2:?}; shift ;;
 		--spill) compress=1; spill=${2:?}; shift ;;
 		--spill-size) spillsize=${2:?}; shift ;;
+		--cipher) compress=1; ciph=${2:?}; shift ;;
 		*) die "unknown option: $1" ;;
 		esac
 		shift
@@ -120,12 +149,14 @@ add)
 		fi
 	fi
 	[ -e "$CONF_DIR/$name.conf" ] && die "$name already exists (vroomctl remove $name)"
+	no_start
 	if [ "$compress" = 1 ]; then
 		# A full compressed store refuses writes: swap survives that, a filesystem does not.
 		[ "$mode" = mount ] && die "--compress is for --swap and --raw, not --mount"
 		[ -n "$ratio" ] || { [ -n "$spill" ] && ratio=2.2 || ratio=1.5; }
 		[[ $ratio =~ ^[1-7](\.[0-9]+)?$ ]] || die "--ratio takes a number from 1 to 8, such as 1.5"
 		[[ $spillsize =~ ^[0-9]+$ ]] || die "--spill-size takes a number of MiB"
+		[ "$ciph" = aes ] || [ "$ciph" = chacha20 ] || die "--cipher is aes or chacha20"
 		if [ -n "$spill" ]; then
 			[[ $spill == /* && $spill != *[[:space:]]* ]] || die "--spill needs an absolute path without spaces"
 			[ -d "$spill" ] && spill=${spill%/}/vroom-$name.spill
@@ -148,6 +179,7 @@ add)
 		echo "VROOM_MODE=$mode"
 		echo "VROOM_COMPRESS=$ratio"
 		[ -n "$spill" ] && printf 'VROOM_SPILL=%s\nVROOM_SPILL_MIB=%s\n' "$spill" "$spillsize"
+		[ "$compress" = 1 ] && echo "VROOM_CIPHER=$ciph"
 		[ "$mode" = swap ] && echo "VROOM_PRIO=$prio"
 		[ "$mode" = mount ] && printf 'VROOM_MOUNT=%s\nVROOM_MOUNT_MODE=%s\n' "$mnt" "$mntmode"
 	} > "$conf"
@@ -162,8 +194,8 @@ add)
 	;;
 remove)
 	need_root
-	load "${1:?usage: vroomctl remove NAME}"
-	stop_device
+	load "${1:?usage: vroomctl remove NAME [--force]}"
+	stop_device "${2:-}"
 	systemctl disable -q "$unit" 2>/dev/null || true
 	systemctl reset-failed "$unit" 2>/dev/null || true
 	rm -f "$CONF_DIR/$name.conf"
@@ -171,12 +203,13 @@ remove)
 	;;
 stop)
 	need_root
-	load "${1:?usage: vroomctl stop NAME}"
-	stop_device
+	load "${1:?usage: vroomctl stop NAME [--force]}"
+	stop_device "${2:-}"
 	;;
 start)
 	need_root
 	load "${1:?usage: vroomctl start NAME}"
+	no_start
 	systemctl start "$unit"
 	;;
 list | status)
@@ -219,6 +252,10 @@ list | status)
 	if command -v nvidia-smi >/dev/null; then
 		nvidia-smi --query-gpu=index,name,memory.used,memory.total --format=csv,noheader |
 			sed 's/^/GPU /'
+	fi
+	if driver_mismatch; then
+		echo "WARNING: $upgraded (libraries $lver, kernel module still $kver)."
+		echo "         Running devices are unaffected, but none can be started until you reboot: do not stop them."
 	fi
 	if grep -qs 'PreserveVideoMemoryAllocations: 0' /proc/driver/nvidia/params; then
 		echo "WARNING: the driver does not preserve VRAM across suspend; suspending destroys device contents"
@@ -309,7 +346,7 @@ _detach) # ExecStop: must succeed before the daemon is asked to exit
 	detach
 	;;
 *)
-	sed -n '2,23p' "$0" >&2
+	sed -n '2,25p' "$0" >&2
 	exit 1
 	;;
 esac

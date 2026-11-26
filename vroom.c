@@ -34,7 +34,9 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/eventfd.h>
 #include <sys/prctl.h>
+#include <poll.h>
 #include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -118,7 +120,8 @@ static void vram_init(int gpu, uint64_t size_mib)
 	char name[128] = "?";
 	size_t free_b, total_b;
 	if ((r = cu.Init(0)))
-		die("cuInit failed (CUDA error %d)", r);
+		die("cuInit failed (CUDA error %d)%s", r,
+		    r == 803 ? ": the NVIDIA driver has been upgraded and its kernel module has not; reboot" : "");
 	if ((r = cu.DeviceGet(&dev, gpu)))
 		die("no CUDA GPU with index %d (error %d)", gpu, r);
 	cu.DeviceGetName(name, sizeof name, dev);
@@ -202,7 +205,7 @@ static int vram_rw(int wr, uint64_t off, char *buf, size_t len)
  * straight from it.
  */
 #define SEG (1 * MiB)
-#define REC_HDR 8
+#define REC_HDR 32
 #define RAW_ABOVE 3584 /* a page that does not get below this is stored as it is */
 #define STAGE_BYTES (BUFSZ + BUFSZ / BLK * REC_HDR + BLK)
 /* Reads from the spill file are block-aligned, so each run of records can carry two blocks of slack. */
@@ -218,7 +221,31 @@ enum { SEG_FREE, SEG_OPEN, SEG_CLOSED, SEG_CLEANING };
 struct rec {
 	uint32_t id; /* which record this is: see cs.rloc */
 	uint16_t len, pad;
+	uint64_t nonce;	 /* never used twice in the life of the key */
+	uint8_t tag[16]; /* proves the data, the id and the length are what was stored */
 };
+
+/*
+ * Everything stored is encrypted, record by record, under a key made up at
+ * start and never written anywhere: what is left on the card or in the spill
+ * file once the daemon has gone is noise. The cipher also authenticates, so a
+ * record that has been altered or has rotted is an I/O error, not wrong data.
+ * AES-256-GCM unless --cipher chacha20 asks for ChaCha20-Poly1305, which is
+ * the one to use on a CPU with no AES instructions. From libcrypto.so.3.
+ */
+static struct {
+	void *(*CtxNew)(void);
+	const void *(*Aes)(void);
+	const void *(*ChaCha)(void);
+	int (*Init)(void *, const void *, void *, const unsigned char *, const unsigned char *, int);
+	int (*Update)(void *, unsigned char *, int *, const unsigned char *, int);
+	int (*Final)(void *, unsigned char *, int *);
+	int (*Ctrl)(void *, int, int, void *);
+} ev;
+static const char *cipher_name = "aes";
+static const void *cipher;
+static unsigned char cipher_key[32];
+static uint64_t next_nonce;
 
 static struct {
 	void *(*CreateCCtx)(void);
@@ -245,6 +272,7 @@ static struct {
 	uint32_t *used;	 /* bytes appended so far */
 	uint8_t *state;
 	uint64_t *seq;	 /* when it was opened, for finding the oldest */
+	uint16_t *pins;	 /* readers at work in a spill segment, which must not be rewritten meanwhile */
 	uint32_t *freelist, nseg, nfree, open;
 	uint32_t *sfree, nspill, nsfree; /* spill segments are numbered nseg onwards */
 	char *gcbuf, *evbuf, *rebuf;
@@ -261,7 +289,7 @@ static void *rehydrate_thread(void *arg);
 
 /* Per-thread compressor state and page-locked buffer for records on their way in or out. */
 static __thread struct {
-	void *cc, *dc;
+	void *cc, *dc, *seal, *open;
 	char *stage, *page;
 } ct;
 
@@ -277,8 +305,33 @@ static void ct_init(void)
 	ct.page = malloc(BLK);
 	ct.cc = z.CreateCCtx();
 	ct.dc = z.CreateDCtx();
-	if (!ct.cc || !ct.dc || !ct.page)
-		die("cannot create zstd contexts");
+	ct.seal = ev.CtxNew();
+	ct.open = ev.CtxNew();
+	if (!ct.cc || !ct.dc || !ct.page || !ct.seal || !ct.open ||
+	    ev.Init(ct.seal, cipher, NULL, cipher_key, NULL, 1) != 1 ||
+	    ev.Init(ct.open, cipher, NULL, cipher_key, NULL, 0) != 1)
+		die("cannot set up compression and encryption");
+}
+
+/* Encrypt (seal) or check and decrypt a record's data where it lies. r->id and r->len must be set. */
+static int rec_crypt(int seal, struct rec *r, char *data)
+{
+	void *c = seal ? ct.seal : ct.open;
+	unsigned char iv[12] = { 0 }, *d = (unsigned char *)data;
+	int n;
+
+	if (seal)
+		r->nonce = __atomic_add_fetch(&next_nonce, 1, __ATOMIC_RELAXED);
+	memcpy(iv, &r->nonce, 8);
+	if (ev.Init(c, NULL, NULL, NULL, iv, -1) != 1 ||
+	    ev.Update(c, NULL, &n, (unsigned char *)r, 8) != 1 || /* the id and length are vouched for too */
+	    ev.Update(c, d, &n, d, r->len) != 1)
+		return -1;
+	if (!seal && ev.Ctrl(c, 0x11 /* set tag */, 16, r->tag) != 1)
+		return -1;
+	if (ev.Final(c, d + n, &n) != 1)
+		return -1;
+	return seal && ev.Ctrl(c, 0x10 /* get tag */, 16, r->tag) != 1 ? -1 : 0;
 }
 
 static void cs_init(void)
@@ -291,6 +344,23 @@ static void cs_init(void)
 	z.Compress = sym(lib, "ZSTD_compressCCtx");
 	z.Decompress = sym(lib, "ZSTD_decompressDCtx");
 	z.IsError = sym(lib, "ZSTD_isError");
+	if (!(lib = dlopen("libcrypto.so.3", RTLD_NOW)))
+		die("--compress needs libcrypto.so.3: %s", dlerror());
+	ev.CtxNew = sym(lib, "EVP_CIPHER_CTX_new");
+	ev.Aes = sym(lib, "EVP_aes_256_gcm");
+	ev.ChaCha = sym(lib, "EVP_chacha20_poly1305");
+	ev.Init = sym(lib, "EVP_CipherInit_ex");
+	ev.Update = sym(lib, "EVP_CipherUpdate");
+	ev.Final = sym(lib, "EVP_CipherFinal_ex");
+	ev.Ctrl = sym(lib, "EVP_CIPHER_CTX_ctrl");
+	if (!strcmp(cipher_name, "aes"))
+		cipher = ev.Aes();
+	else if (!strcmp(cipher_name, "chacha20"))
+		cipher = ev.ChaCha();
+	else
+		die("--cipher is aes or chacha20");
+	if (getrandom(cipher_key, sizeof cipher_key, 0) != sizeof cipher_key)
+		die("cannot get random bytes for the key: %s", strerror(errno));
 	/* Nobody outside should be able to make two pages hash alike on purpose. */
 	if (getrandom(&hash_secret, sizeof hash_secret, 0) != sizeof hash_secret)
 		hash_secret = (uint64_t)time(NULL) * 0x9E3779B97F4A7C15ULL ^ (uintptr_t)&lib;
@@ -328,6 +398,7 @@ static void cs_init(void)
 	cs.live = calloc(all, sizeof *cs.live);
 	cs.used = calloc(all, sizeof *cs.used);
 	cs.seq = calloc(all, sizeof *cs.seq);
+	cs.pins = calloc(all, sizeof *cs.pins);
 	cs.state = calloc(all, 1);
 	cs.freelist = calloc(cs.nseg, sizeof *cs.freelist);
 	cs.sfree = calloc(cs.nspill + 1, sizeof *cs.sfree);
@@ -341,7 +412,7 @@ static void cs_init(void)
 		p = NULL;
 	cs.rebuf = p;
 	if (!cs.map || !cs.rloc || !cs.rhash || !cs.rref || !cs.idx || !cs.live || !cs.used || !cs.seq ||
-	    !cs.state || !cs.freelist || !cs.sfree || !cs.gcbuf || !cs.evbuf || !cs.rebuf)
+	    !cs.pins || !cs.state || !cs.freelist || !cs.sfree || !cs.gcbuf || !cs.evbuf || !cs.rebuf)
 		die("out of memory for the compressed store's tables");
 	for (uint32_t id = 1; id <= cs.rmax; id++)
 		cs.rref[id] = id < cs.rmax ? id + 1 : 0;
@@ -590,7 +661,7 @@ static int evict(void)
 	if (reuse) {
 		slot = 0;
 		for (uint32_t s = cs.nseg; s < cs.nseg + cs.nspill; s++)
-			if (cs.state[s] == SEG_CLOSED && cs.live[s] < best)
+			if (cs.state[s] == SEG_CLOSED && cs.live[s] < best && !cs.pins[s])
 				best = cs.live[s], slot = s;
 		if (best > SEG - SEG / 16)
 			return ENOSPC;
@@ -598,8 +669,15 @@ static int evict(void)
 			     (uint64_t)(slot - cs.nseg) * SEG))
 			return EIO;
 		out = survivors(cs.gcbuf, slot, cs.evbuf, 0, SEG, NULL);
-	} else {
-		slot = cs.sfree[cs.nsfree - 1];
+	} else { /* a free one that nobody is still reading: bring it to the top of the stack */
+		uint32_t k = cs.nsfree;
+		while (k && cs.pins[cs.sfree[k - 1]])
+			k--;
+		if (!k)
+			return ENOSPC;
+		slot = cs.sfree[k - 1];
+		cs.sfree[k - 1] = cs.sfree[cs.nsfree - 1];
+		cs.sfree[cs.nsfree - 1] = slot;
 	}
 	size_t own = out;
 	for (;;) {
@@ -729,11 +807,17 @@ static int page_is_zero(const char *p)
 static int rec_matches(uint32_t id, const char *page)
 {
 	uint64_t e = cs.rloc[id];
-	if (E_OFF(e) >= phys_size || vram_rw(0, E_OFF(e) + REC_HDR, ct.stage, E_LEN(e)))
+	struct rec r;
+	char *data = ct.stage + REC_HDR;
+
+	if (E_OFF(e) >= phys_size || vram_rw(0, E_OFF(e), ct.stage, REC_HDR + E_LEN(e)))
 		return 0;
-	if (E_LEN(e) == BLK)
-		return !memcmp(ct.stage, page, BLK);
-	return z.Decompress(ct.dc, ct.page, BLK, ct.stage, E_LEN(e)) == BLK && !memcmp(ct.page, page, BLK);
+	memcpy(&r, ct.stage, sizeof r);
+	if (r.len != E_LEN(e) || rec_crypt(0, &r, data))
+		return 0;
+	if (r.len == BLK)
+		return !memcmp(data, page, BLK);
+	return z.Decompress(ct.dc, ct.page, BLK, data, r.len) == BLK && !memcmp(ct.page, page, BLK);
 }
 
 static int cs_write(uint64_t off, const char *buf, size_t len)
@@ -758,17 +842,20 @@ static int cs_write(uint64_t off, const char *buf, size_t len)
 		pthread_mutex_lock(&cs.lock);
 		for (size_t i = 0; i < n; i++) {
 			uint32_t r;
-			if (kind[i] != NEW || !(r = idx_find(hash[i])) || cs.rref[r] == UINT32_MAX ||
-			    !rec_matches(r, buf + i * BLK))
+			if (kind[i] != NEW)
 				continue;
-			cs.rref[r]++;
-			id[i] = r;
-			kind[i] = SHARED;
-			fresh--;
+			if ((r = idx_find(hash[i])) && cs.rref[r] != UINT32_MAX && rec_matches(r, buf + i * BLK)) {
+				cs.rref[r]++;
+				id[i] = r;
+				kind[i] = SHARED;
+				fresh--;
+			} else if (!(id[i] = rec_alloc(hash[i]))) { /* the rest get a record of their own */
+				err = ENOSPC;
+			}
 		}
 		pthread_mutex_unlock(&cs.lock);
 	}
-	for (size_t i = 0; i < n && fresh; i++) {
+	for (size_t i = 0; i < n && fresh && !err; i++) {
 		const char *p = buf + i * BLK;
 		if (kind[i] != NEW)
 			continue;
@@ -777,22 +864,13 @@ static int cs_write(uint64_t off, const char *buf, size_t len)
 			memcpy(ct.stage + out + REC_HDR, p, BLK);
 			c = BLK;
 		}
-		struct rec r = { .len = c };
+		struct rec r = { .id = id[i], .len = c };
+		if (rec_crypt(1, &r, ct.stage + out + REC_HDR))
+			err = EIO;
 		memcpy(ct.stage + out, &r, sizeof r);
 		out += REC_HDR + c;
 	}
 	pthread_mutex_lock(&cs.lock);
-	for (size_t i = 0, pos = 0; i < n && fresh; i++) { /* name the new records */
-		struct rec r;
-		if (kind[i] != NEW)
-			continue;
-		memcpy(&r, ct.stage + pos, sizeof r);
-		r.id = id[i] = rec_alloc(hash[i]);
-		memcpy(ct.stage + pos, &r, sizeof r);
-		pos += REC_HDR + r.len;
-		if (!r.id)
-			err = ENOSPC;
-	}
 	if (out && !err && !(err = make_room(out)))
 		err = log_append(ct.stage, out);
 	for (size_t i = 0; i < n; i++) {
@@ -815,14 +893,19 @@ static int cs_write(uint64_t off, const char *buf, size_t len)
 static int cs_read(uint64_t off, char *buf, size_t len)
 {
 	uint64_t lpn = off / BLK;
-	size_t n = len / BLK, in = 0;
+	size_t n = len / BLK, in = 0, nsp = 0;
 	uint32_t pos[MAX_PAGES], clen[MAX_PAGES];
+	struct {
+		uint64_t at, start, end;
+		size_t to, span;
+	} sp[MAX_PAGES]; /* reads of the spill file, done once the lock is dropped */
+	int bad = 0;
 
 	if (off % BLK || len % BLK || n > MAX_PAGES)
 		return EINVAL;
 	ct_init();
 	pthread_mutex_lock(&cs.lock);
-	for (size_t i = 0; i < n;) {
+	for (size_t i = 0; i < n && !bad;) {
 		uint64_t e = cs.rloc[cs.map[lpn + i]], start, end;
 		if (!e) {
 			clen[i++] = 0;
@@ -836,38 +919,76 @@ static int cs_read(uint64_t off, char *buf, size_t len)
 			clen[i] = E_LEN(e);
 			end += REC_HDR + E_LEN(e);
 		} while (++i < n && (e = cs.rloc[cs.map[lpn + i]]) && E_OFF(e) == end && end != phys_size);
-		int bad;
 		if (start < phys_size) {
 			bad = vram_rw(0, start, ct.stage + in, end - start);
 			in += end - start;
-		} else { /* in the spill file: whole blocks, into a block-aligned place */
-			uint64_t fo = start - phys_size, a = fo & ~(uint64_t)(BLK - 1);
-			size_t al = (in + BLK - 1) & ~(size_t)(BLK - 1), shift = al + (fo - a) - in;
-			size_t span = ((fo + (end - start) + BLK - 1) & ~(uint64_t)(BLK - 1)) - a;
-			for (size_t k = first; k < i; k++)
-				pos[k] += shift;
-			bad = spill_io(0, ct.stage + al, span, a);
-			in = al + span;
+			continue;
 		}
-		if (bad) {
-			pthread_mutex_unlock(&cs.lock);
-			return EIO;
-		}
+		/*
+		 * In the spill file: whole blocks, into a block-aligned place, and
+		 * not while holding the lock, which everything else needs. What is
+		 * read cannot change meanwhile: records are never altered where
+		 * they lie, and a segment with a reader is not rewritten.
+		 */
+		uint64_t fo = start - phys_size, a = fo & ~(uint64_t)(BLK - 1);
+		size_t al = (in + BLK - 1) & ~(size_t)(BLK - 1), shift = al + (fo - a) - in;
+		for (size_t k = first; k < i; k++)
+			pos[k] += shift;
+		sp[nsp].at = a, sp[nsp].to = al, sp[nsp].start = start, sp[nsp].end = end;
+		sp[nsp].span = ((fo + (end - start) + BLK - 1) & ~(uint64_t)(BLK - 1)) - a;
+		for (uint64_t g = start / SEG; g <= (end - 1) / SEG; g++)
+			cs.pins[g]++;
+		in = al + sp[nsp++].span;
 	}
 	pthread_mutex_unlock(&cs.lock);
+	for (size_t k = 0; k < nsp; k++)
+		if (!bad)
+			bad = spill_io(0, ct.stage + sp[k].to, sp[k].span, sp[k].at);
+	if (nsp) {
+		pthread_mutex_lock(&cs.lock);
+		for (size_t k = 0; k < nsp; k++)
+			for (uint64_t g = sp[k].start / SEG; g <= (sp[k].end - 1) / SEG; g++)
+				cs.pins[g]--;
+		pthread_mutex_unlock(&cs.lock);
+	}
+	if (bad)
+		return EIO;
 	for (size_t i = 0; i < n; i++) {
-		char *p = buf + i * BLK;
-		if (!clen[i])
+		char *p = buf + i * BLK, *data = ct.stage + pos[i];
+		struct rec r;
+
+		if (!clen[i]) {
 			memset(p, 0, BLK);
-		else if (clen[i] == BLK)
-			memcpy(p, ct.stage + pos[i], BLK);
-		else if (z.Decompress(ct.dc, p, BLK, ct.stage + pos[i], clen[i]) != BLK) {
+			continue;
+		}
+		memcpy(&r, data - REC_HDR, sizeof r);
+		if (r.len != clen[i] || rec_crypt(0, &r, data)) {
+			fprintf(stderr, "vroom: stored page %llu has been altered or damaged\n",
+				(unsigned long long)(lpn + i));
+			return EIO;
+		}
+		if (r.len == BLK)
+			memcpy(p, data, BLK);
+		else if (z.Decompress(ct.dc, p, BLK, data, r.len) != BLK) {
 			fprintf(stderr, "vroom: stored page %llu does not decompress\n",
 				(unsigned long long)(lpn + i));
 			return EIO;
 		}
 	}
 	return 0;
+}
+
+/* Would reading this have to wait for the spill file? */
+static int cs_reads_spill(uint64_t off, size_t len)
+{
+	int yes = 0;
+	if (spill_fd < 0 || off % BLK)
+		return 0;
+	pthread_mutex_lock(&cs.lock);
+	for (uint64_t p = off / BLK; p < (off + len) / BLK && !yes; p++)
+		yes = cs.map[p] && E_OFF(cs.rloc[cs.map[p]]) >= phys_size;
+	pthread_mutex_unlock(&cs.lock);
+	return yes;
 }
 
 /* Discard: the pages read as zeros from now on and their space is given back. */
@@ -1348,8 +1469,79 @@ static int ring_enter(struct ring *r, unsigned wait)
 	}
 }
 
+/* Queue a multishot poll: a completion each time fd becomes readable. */
+static void ring_poll(struct ring *r, int fd, uint64_t ud)
+{
+	unsigned idx = r->tail & *r->sq_mask;
+	struct io_uring_sqe *s = (struct io_uring_sqe *)(r->sqes + ((size_t)idx << r->shift));
+	memset(s, 0, (size_t)1 << r->shift);
+	s->opcode = IORING_OP_POLL_ADD;
+	s->fd = fd;
+	s->poll32_events = POLLIN;
+	s->len = IORING_POLL_ADD_MULTI;
+	s->user_data = ud;
+	r->sq_array[idx] = idx;
+	r->tail++;
+	r->pending++;
+}
+
 #define UBLK_DEPTH 32
 #define UBLK_IO_BYTES (256 * 1024)
+#define POLL_UD UINT64_MAX
+#define SLOW_READERS 4
+
+/*
+ * A queue is one thread, and a read that has to go to the spill file takes
+ * the disk's time, not the card's. Such reads are handed to helper threads so
+ * that the queue keeps serving what is on the card; a helper says it has
+ * finished through the queue's eventfd, and the queue completes the request.
+ */
+struct slow {
+	int q;
+	unsigned tag;
+	uint64_t off;
+	uint32_t len;
+	int res;
+	char *buf;
+	struct slow *next;
+};
+static struct {
+	pthread_mutex_t lock;
+	pthread_cond_t more;
+	struct slow *head, *tail;
+} slowq = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, NULL };
+static struct {
+	pthread_mutex_t lock;
+	struct slow *done;
+	int efd;
+} qdone[MAX_THREADS];
+
+static void *slow_reader(void *arg)
+{
+	(void)arg;
+	cu.CtxSetCurrent(ctx);
+	prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0);
+	for (;;) {
+		pthread_mutex_lock(&slowq.lock);
+		while (!slowq.head)
+			pthread_cond_wait(&slowq.more, &slowq.lock);
+		struct slow *j = slowq.head;
+		if (!(slowq.head = j->next))
+			slowq.tail = NULL;
+		pthread_mutex_unlock(&slowq.lock);
+
+		int err = dev_rw(0, j->off, j->buf, j->len);
+		j->res = err ? -err : (int)j->len;
+		pthread_mutex_lock(&qdone[j->q].lock);
+		j->next = qdone[j->q].done;
+		qdone[j->q].done = j;
+		pthread_mutex_unlock(&qdone[j->q].lock);
+		uint64_t one = 1;
+		if (write(qdone[j->q].efd, &one, sizeof one) < 0)
+			fprintf(stderr, "vroom: waking queue %d: %s\n", j->q, strerror(errno));
+	}
+	return NULL;
+}
 static struct ring ctrl_ring;
 static int ctrl_fd, cdev_fd;
 static unsigned ublk_id, ublk_io_bytes;
@@ -1373,10 +1565,12 @@ static void *ublk_queue(void *arg)
 	int q = (intptr_t)arg, r;
 	struct ring ring;
 	char *buf[UBLK_DEPTH];
+	struct slow *slow = calloc(UBLK_DEPTH, sizeof *slow);
+	int handoff = spill_fd >= 0;
 
 	cu.CtxSetCurrent(ctx);
 	prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0);
-	ring_init(&ring, UBLK_DEPTH,
+	ring_init(&ring, 2 * UBLK_DEPTH,
 		  IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN);
 
 	size_t pg = sysconf(_SC_PAGESIZE);
@@ -1396,6 +1590,13 @@ static void *ublk_queue(void *arg)
 		struct ublksrv_io_cmd c = { .q_id = q, .tag = tag, .addr = (uintptr_t)p };
 		ring_cmd(&ring, cdev_fd, UBLK_U_IO_FETCH_REQ, &c, sizeof c, tag);
 	}
+	if (handoff) {
+		pthread_mutex_init(&qdone[q].lock, NULL);
+		qdone[q].efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+		if (qdone[q].efd < 0 || !slow)
+			die("ublk: eventfd: %s", strerror(errno));
+		ring_poll(&ring, qdone[q].efd, POLL_UD);
+	}
 
 	for (unsigned live = UBLK_DEPTH; live;) {
 		if ((r = ring_enter(&ring, 1)))
@@ -1404,6 +1605,24 @@ static void *ublk_queue(void *arg)
 		for (; head != tail; head++) {
 			struct io_uring_cqe *e = &ring.cqes[head & *ring.cq_mask];
 			unsigned tag = e->user_data;
+			if (e->user_data == POLL_UD) { /* helpers have finished some reads */
+				uint64_t v;
+				if (read(qdone[q].efd, &v, sizeof v) < 0 && errno != EAGAIN)
+					die("ublk: eventfd: %s", strerror(errno));
+				pthread_mutex_lock(&qdone[q].lock);
+				struct slow *j = qdone[q].done, *nx;
+				qdone[q].done = NULL;
+				pthread_mutex_unlock(&qdone[q].lock);
+				for (; j; j = nx) {
+					nx = j->next;
+					struct ublksrv_io_cmd c = { .q_id = q, .tag = j->tag, .result = j->res,
+								    .addr = (uintptr_t)j->buf };
+					ring_cmd(&ring, cdev_fd, UBLK_U_IO_COMMIT_AND_FETCH_REQ, &c, sizeof c, j->tag);
+				}
+				if (!(e->flags & IORING_CQE_F_MORE))
+					ring_poll(&ring, qdone[q].efd, POLL_UD);
+				continue;
+			}
 			if (e->res != UBLK_IO_RES_OK) { /* device stopping: no re-fetch */
 				if (e->res != UBLK_IO_RES_ABORT)
 					fprintf(stderr, "vroom: ublk queue %d tag %u: %s\n", q, tag,
@@ -1414,6 +1633,20 @@ static void *ublk_queue(void *arg)
 			const struct ublksrv_io_desc *d = &iod[tag];
 			uint64_t off = d->start_sector << 9, len = (uint64_t)d->nr_sectors << 9;
 			int res;
+			if (handoff && (d->op_flags & 0xff) == UBLK_IO_OP_READ && len <= ublk_io_bytes &&
+			    off + len <= dev_size && cs_reads_spill(off, len)) {
+				struct slow *j = &slow[tag];
+				*j = (struct slow){ .q = q, .tag = tag, .off = off, .len = len, .buf = buf[tag] };
+				pthread_mutex_lock(&slowq.lock);
+				if (slowq.tail)
+					slowq.tail->next = j;
+				else
+					slowq.head = j;
+				slowq.tail = j;
+				pthread_cond_signal(&slowq.more);
+				pthread_mutex_unlock(&slowq.lock);
+				continue; /* completed when a helper reports back */
+			}
 			switch (d->op_flags & 0xff) {
 			case UBLK_IO_OP_READ:
 			case UBLK_IO_OP_WRITE:
@@ -1504,6 +1737,10 @@ static void serve_ublk(int threads)
 		usleep(100000); /* udev may still be creating the node */
 	}
 
+	for (int i = 0; spill_fd >= 0 && i < SLOW_READERS; i++) {
+		pthread_t t;
+		pthread_create(&t, NULL, slow_reader, NULL);
+	}
 	for (int i = 0; i < threads; i++)
 		pthread_create(&tq[i], NULL, ublk_queue, (void *)(intptr_t)i);
 	/* Returns once every queue has handed all its tags to the kernel. */
@@ -1824,6 +2061,26 @@ static void selftest_compress(int threads)
 	check_all(fd, "in sequential read");
 	printf("sequential read   %7.0f MiB/s  (verified)\n", dev_size / MiB / (now() - t));
 
+	/* What is on the card must not be the page, and altering it must be noticed, not returned. */
+	for (uint64_t b = 0; b < npages; b++) {
+		uint64_t e = cs.rloc[cs.map[b]];
+		char was;
+		if (!e || E_LEN(e) != BLK || E_OFF(e) >= phys_size)
+			continue; /* looking for a page stored as it is, uncompressed */
+		pattern(ta, b, tver[b]);
+		if (vram_rw(0, E_OFF(e) + REC_HDR, tb, BLK) || !memcmp(ta, tb, BLK))
+			die("selftest: page %llu is stored unencrypted", (unsigned long long)b);
+		was = tb[100], tb[100] ^= 1;
+		if (vram_rw(1, E_OFF(e) + REC_HDR + 100, tb + 100, 1) ||
+		    nbd_io(fd, NBD_CMD_READ, b * BLK, tb, BLK) != EIO)
+			die("selftest: an altered page was not refused");
+		if (vram_rw(1, E_OFF(e) + REC_HDR + 100, &was, 1))
+			die("selftest: could not restore the page");
+		check_pages(fd, b, 1, "after restoring an altered page");
+		printf("encryption            ok (%s; an altered page is refused)\n", cipher_name);
+		break;
+	}
+
 	/* Rewrite pages at random until the log has wrapped and segments have had to be cleaned. */
 	uint64_t ops = npages < 400000 ? npages : 400000;
 	t = now();
@@ -1871,6 +2128,16 @@ static void selftest_compress(int threads)
 		printf("incompressible    %llu MiB in VRAM, %llu MiB spilled%s; all read back at %.0f MiB/s\n",
 		       (unsigned long long)((cs.bytes - cs.sbytes) / MiB), (unsigned long long)(cs.sbytes / MiB),
 		       err ? ", then refused" : "", dev_size / MiB / (now() - t));
+		for (int k = 1; k <= threads; k += threads - 1 ? threads - 1 : 1) {
+			t = now();
+			for (int i = 0; i < k; i++)
+				pthread_create(&tc[i], NULL, rand_reader, (void *)(intptr_t)fds[i]);
+			for (int i = 0; i < k; i++)
+				pthread_join(tc[i], NULL);
+			printf("4K random read    %7.0f IOPS  (%d thread%s, %llu%% of pages on disk)\n",
+			       (double)RAND_OPS * k / (now() - t), k, k > 1 ? "s" : "",
+			       (unsigned long long)(cs.sbytes * 100 / cs.bytes));
+		}
 		/* Free the newest half, which is what is in VRAM: the spilled pages should come back. */
 		uint64_t half = npages / 2 & ~63ULL;
 		for (uint64_t off = half * BLK; off < dev_size; off += 1024 * MiB) {
@@ -1936,6 +2203,8 @@ int main(int argc, char **argv)
 			cratio = atof(v), i++;
 		else if (!strcmp(argv[i], "--zlevel") && v)
 			clevel = atoi(v), i++;
+		else if (!strcmp(argv[i], "--cipher") && v)
+			cipher_name = v, i++;
 		else if (!strcmp(argv[i], "--spill") && v)
 			spill_path = *v ? v : NULL, i++;
 		else if (!strcmp(argv[i], "--spill-size") && v)
@@ -1989,6 +2258,8 @@ int main(int argc, char **argv)
 	 */
 	if (!test)
 		block_stop_signals();
+	if (getenv("VROOM_CIPHER") && *getenv("VROOM_CIPHER"))
+		cipher_name = getenv("VROOM_CIPHER");
 	vram_init(gpu, size_mib);
 	if (getenv("VROOM_COUNT") && atoi(getenv("VROOM_COUNT"))) {
 		cn_init();
