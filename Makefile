@@ -31,6 +31,7 @@ deb:
 	$(MAKE) install PREFIX=/usr DESTDIR=$(DEBROOT)
 	install -Dm644 README.md $(DEBROOT)/usr/share/doc/vroom/README.md
 	install -Dm644 LICENSE $(DEBROOT)/usr/share/doc/vroom/copyright
+	install -Dm644 packaging/needrestart.conf $(DEBROOT)/etc/needrestart/conf.d/vroom.conf
 	install -d $(DEBROOT)/DEBIAN
 	sed -e 's/@VERSION@/$(VERSION)/' -e 's/@ARCH@/$(ARCH)/' packaging/control.in > $(DEBROOT)/DEBIAN/control
 	install -m755 packaging/postinst packaging/prerm packaging/postrm $(DEBROOT)/DEBIAN/

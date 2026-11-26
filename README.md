@@ -87,7 +87,9 @@ nothing, and tells you at once whether the driver and card are usable.
 
 Install the new package, or run `sudo make install` again. Devices that are
 running keep the old daemon until they are next stopped and started, so
-nothing in use is disturbed.
+nothing in use is disturbed. The package tells Ubuntu's `needrestart` to
+leave vroom's daemons alone; before 0.3.0 it would drain and restart them
+during an upgrade.
 
 ### Uninstall
 
@@ -197,7 +199,9 @@ forgetting the definition, e.g. to lend the GPU to something else. `remove`
 and `stop` refuse, and change nothing, if the device is busy. Each device is
 the systemd unit `vroom@NAME` (logs: `journalctl -u vroom@NAME`), defined by
 `/etc/vroom/NAME.conf`. `sudo vroomctl bench NAME` runs a read-only latency
-test that is safe on a live device.
+test that is safe on a live device. `vroomctl stats [NAME]` shows what a device
+has read and written and, where they are switched on, its compression and
+repeat counts; `watch -n 2 vroomctl stats` keeps it on screen.
 
 To move pages that are already in disk swap over to the VRAM, cycle the disk
 swap: `swapoff /swap.img && swapon /swap.img`.

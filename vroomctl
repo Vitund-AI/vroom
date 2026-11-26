@@ -5,6 +5,7 @@
 #   vroomctl stop NAME | start NAME keep the definition, release/reclaim the VRAM
 #   vroomctl list                   devices, state and usage
 #   vroomctl bench NAME             read-only 4K latency test of a live device
+#   vroomctl stats [NAME]           I/O totals, and compression and repeat counts if on
 #   vroomctl selftest [--size MiB]  integrity + speed test, no root needed
 # add options:
 #   --size MiB      device size (default: all free VRAM less 256 MiB)
@@ -223,6 +224,40 @@ list | status)
 		echo "WARNING: the driver does not preserve VRAM across suspend; suspending destroys device contents"
 	fi
 	;;
+stats)
+	for f in "$CONF_DIR"/${1:-*}.conf; do
+		[ -e "$f" ] || die "no such device: ${1:-} (see 'vroomctl list')"
+		load "$(basename "$f" .conf)"
+		[ -r "/sys/block/$kname/stat" ] || { echo "$name: not running"; continue; }
+		echo "$name ($DEV)"
+		# /sys/block/DEV/stat: reads, -, sectors read, ms, writes, -, sectors written, ms, ...
+		awk '{ printf "  read     %10.0f MiB in %d requests\n  written  %10.0f MiB in %d requests\n",
+			$3 / 2048, $1, $7 / 2048, $5 }' "/sys/block/$kname/stat"
+		if is_swap; then
+			awk -v d="$DEV" '$1 == d { printf "  swap     %10.0f MiB used of %.0f\n", $4 / 1024, $3 / 1024 }' /proc/swaps
+		fi
+		if [ -r "/run/vroom/$kname.stat" ]; then
+			(. "/run/vroom/$kname.stat"; awk -v p="$PAGES" -v b="$STORED_BYTES" -v v="$VRAM_BYTES" \
+				-v s="$SPILLED_BYTES" -v r="$REFUSED" 'BEGIN { m = 1048576
+				printf "  holding  %10.0f MiB of pages in %.0f MiB of VRAM", p * 4096 / m, b / m
+				if (s) printf " and %.0f MiB on disk", s / m
+				if (b + s >= m) printf " (%.2fx)", p * 4096 / (b + s)
+				printf "\n  VRAM     %9d%% full\n", b * 100 / v
+				if (r) printf "  REFUSED  %10d writes: the store was full\n", r }')
+		fi
+		if [ -r "/run/vroom/$kname.count" ]; then
+			(. "/run/vroom/$kname.count"; awk -v w="$WRITES" -v z="$ZERO" -v sb="$SAME_BLOCK" \
+				-v bo="$BOUNCED" -v du="$DUPLICATE" -v fr="$FRESH" 'BEGIN {
+				if (!w) { print "  pages written: none yet"; exit }
+				printf "  pages written %d, of which\n", w
+				printf "    %5.1f%%  new to the device\n", fr * 100 / w
+				printf "    %5.1f%%  already held, and read back since (out, in, out again)\n", bo * 100 / w
+				printf "    %5.1f%%  already held in another block\n", du * 100 / w
+				printf "    %5.1f%%  the same as what the block held\n", sb * 100 / w
+				printf "    %5.1f%%  all zeros\n", z * 100 / w }')
+		fi
+	done
+	;;
 bench)
 	load "${1:?usage: vroomctl bench NAME}"
 	exec "$here/vroom" --bench "$DEV"
@@ -273,7 +308,7 @@ _detach) # ExecStop: must succeed before the daemon is asked to exit
 	detach
 	;;
 *)
-	sed -n '2,22p' "$0" >&2
+	sed -n '2,23p' "$0" >&2
 	exit 1
 	;;
 esac
