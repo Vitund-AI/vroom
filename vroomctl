@@ -308,7 +308,7 @@ stats)
 			split(perf[k], f, " ")
 			if (!f[2]) return 0
 			printf "  %-9s %-5s %10s %8s %11s %11s", what, dir, size(f[3]), count(f[2]), \
-				f[18] > 0 ? rate(f[17] / f[18] * 1e9) : "-", rate(f[4])
+				(f[18] > 0 ? rate(f[17] / f[18] * 1e9) : "-"), rate(f[4])
 			for (w = 0; w < 2; w++) {
 				o = 5 + w * 6
 				printf "   %11s %8s %8s %8s", rate(f[o + 2]), took(f[o + 3]), took(f[o + 4]), took(f[o + 5])
