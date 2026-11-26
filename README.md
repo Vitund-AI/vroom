@@ -168,15 +168,22 @@ falls below 70% they come back. With the file as large as the device, which
 is the default, writes are never refused. Pages in the file are read at the
 disk's speed, so this is for the cold tail, not a replacement for the card.
 
-`vroomctl selftest --compress 2.2 --spill FILE` on an RTX 4090 with an NVMe
-SSD, test data that compresses 1.9x:
+`vroomctl selftest --compress 1.5` on an RTX 4090, with test data that
+compresses 2.4x:
 
-| | Plain | Compressed | Compressed, part on disk |
-|---|---|---|---|
-| Sequential write | 4,100 MiB/s | 590 MiB/s | 580 MiB/s |
-| Sequential read | 3,550 MiB/s | 1,320 MiB/s | 1,230 MiB/s |
-| 4K random write | 9.5 µs | 16 µs | 16 µs |
-| 4K random read | 9.0 µs | 11.5 µs | 30 µs (a quarter of reads from disk) |
+| | Plain | Compressed |
+|---|---|---|
+| Sequential write | 4,100 MiB/s | 620 MiB/s |
+| Sequential read | 3,550 MiB/s | 1,170 MiB/s |
+| 4K random write | 9.5 µs | 14.5 µs |
+| 4K random read | 9.0 µs | 10.9 µs |
+
+With a quarter of the pages on an NVMe SSD, random reads averaged 30 µs.
+
+Setting `VROOM_COUNT=1` in a device's `/etc/vroom/NAME.conf` makes the daemon
+count, in `/run/vroom/DEVICE.count`, how many pages written were already held
+somewhere on the device. It changes nothing else; it is there to find out
+whether keeping a single copy would be worth building.
 
 Limits to know about: it costs 8 bytes of RAM per page offered (2 MiB per
 GiB); the two water marks are fixed, not learned; and "oldest" is by when a

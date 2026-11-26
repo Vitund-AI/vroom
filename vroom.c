@@ -699,16 +699,152 @@ static int cs_discard(uint64_t off, uint64_t len)
 	return 0;
 }
 
+/*
+ * ---- counting repeats (VROOM_COUNT=1 in the environment) ----
+ *
+ * How often is a page written whose contents the device already holds? Every
+ * page written is hashed and compared with what was last written to each
+ * block. Nothing is done with the answer but count it, into
+ * /run/vroom/DEVICE.count: it says what keeping one copy would save.
+ */
+static int counting;
+static struct {
+	pthread_mutex_t lock;
+	uint64_t *last;	  /* per block: hash of what was last written, 0 if nothing */
+	uint8_t *readback; /* per block: read since it was written */
+	struct slot {
+		uint64_t hash;
+		uint32_t blk, n; /* a block that holds it, and how many do */
+	} *tab;
+	uint64_t cap, filled;
+	uint64_t writes, zero, same_block, bounced, duplicate, fresh, reads;
+} cn = { .lock = PTHREAD_MUTEX_INITIALIZER };
+
+static uint64_t page_hash(const char *p)
+{
+	uint64_t h[4] = { 0x9E3779B97F4A7C15ULL, 0xBF58476D1CE4E5B9ULL, 0x94D049BB133111EBULL, 0xD6E8FEB86659FD93ULL };
+	for (size_t i = 0; i < BLK; i += 32) {
+		uint64_t w[4];
+		memcpy(w, p + i, 32);
+		for (int k = 0; k < 4; k++)
+			h[k] = (h[k] ^ w[k]) * 0x100000001B3ULL, h[k] ^= h[k] >> 29;
+	}
+	uint64_t x = h[0] ^ h[1] * 3 ^ h[2] * 5 ^ h[3] * 7;
+	x ^= x >> 32, x *= 0xD6E8FEB86659FD93ULL, x ^= x >> 32;
+	return x ? x : 1;
+}
+
+static struct slot *cn_find(uint64_t h)
+{
+	uint64_t i = h % cn.cap;
+	while (cn.tab[i].hash && cn.tab[i].hash != h)
+		i = i + 1 == cn.cap ? 0 : i + 1;
+	return &cn.tab[i];
+}
+
+static void cn_add(uint64_t h, uint32_t blk)
+{
+	struct slot *s = cn_find(h);
+	if (!s->hash)
+		s->hash = h, cn.filled++;
+	s->n++, s->blk = blk;
+}
+
+static void cn_init(void)
+{
+	uint64_t nblk = dev_size / BLK;
+	cn.cap = nblk * 3 + 64;
+	cn.last = calloc(nblk, sizeof *cn.last);
+	cn.readback = calloc(nblk, 1);
+	cn.tab = calloc(cn.cap, sizeof *cn.tab);
+	if (!cn.last || !cn.readback || !cn.tab)
+		die("out of memory for the repeat counters");
+}
+
+static void count_io(int wr, uint64_t off, const char *buf, size_t len)
+{
+	uint64_t blk = off / BLK;
+
+	pthread_mutex_lock(&cn.lock);
+	for (size_t i = 0; i < len / BLK; i++, blk++) {
+		if (!wr) {
+			cn.reads++;
+			cn.readback[blk] = 1;
+			continue;
+		}
+		const char *p = buf + i * BLK;
+		uint64_t h = page_hash(p), old = cn.last[blk];
+		struct slot *s;
+
+		cn.writes++;
+		if (page_is_zero(p))
+			cn.zero++;
+		else if (h == old)
+			cn.same_block++;
+		else if ((s = cn_find(h))->hash && s->n) /* some other block holds exactly this */
+			cn.last[s->blk] == h && cn.readback[s->blk] ? cn.bounced++ : cn.duplicate++;
+		else
+			cn.fresh++;
+		if (h != old) {
+			if (old)
+				cn_find(old)->n--;
+			cn_add(h, blk);
+			cn.last[blk] = h;
+		}
+		cn.readback[blk] = 0;
+		if (cn.filled * 3 > cn.cap * 2) { /* too many hashes no block holds any more: start again */
+			memset(cn.tab, 0, cn.cap * sizeof *cn.tab);
+			cn.filled = 0;
+			for (uint64_t b = 0; b < dev_size / BLK; b++)
+				if (cn.last[b])
+					cn_add(cn.last[b], b);
+		}
+	}
+	pthread_mutex_unlock(&cn.lock);
+}
+
+static void count_print(FILE *f)
+{
+	fprintf(f, "WRITES=%llu\nREADS=%llu\nZERO=%llu\nSAME_BLOCK=%llu\nBOUNCED=%llu\nDUPLICATE=%llu\nFRESH=%llu\n",
+		(unsigned long long)cn.writes, (unsigned long long)cn.reads, (unsigned long long)cn.zero,
+		(unsigned long long)cn.same_block, (unsigned long long)cn.bounced,
+		(unsigned long long)cn.duplicate, (unsigned long long)cn.fresh);
+}
+
 /* One read or write of the device, whichever way it is stored. Returns 0 or an errno. */
 static int dev_rw(int wr, uint64_t off, char *buf, size_t len)
 {
+	if (counting && !(off % BLK))
+		count_io(wr, off, buf, len);
 	if (!cratio)
 		return vram_rw(wr, off, buf, len) ? EIO : 0;
 	return wr ? cs_write(off, buf, len) : cs_read(off, buf, len);
 }
 
-/* While serving: keep /run/vroom/DEVICE.stat current for 'vroomctl list', and warn when nearly full. */
 static const char *dev_path;
+static void *count_thread(void *arg)
+{
+	char path[128], tmp[136];
+	const char *base = strrchr(dev_path, '/');
+
+	(void)arg;
+	mkdir("/run/vroom", 0755);
+	snprintf(path, sizeof path, "/run/vroom/%s.count", base ? base + 1 : dev_path);
+	snprintf(tmp, sizeof tmp, "%s.tmp", path);
+	for (;; sleep(10)) {
+		FILE *f = fopen(tmp, "w");
+		if (!f)
+			continue;
+		pthread_mutex_lock(&cn.lock);
+		count_print(f);
+		pthread_mutex_unlock(&cn.lock);
+		fclose(f);
+		rename(tmp, path);
+	}
+	return NULL;
+}
+
+/* While serving: keep /run/vroom/DEVICE.stat current for 'vroomctl list', and warn when nearly full. */
 static void *stat_thread(void *arg)
 {
 	char path[128], tmp[136];
@@ -963,6 +1099,8 @@ static void serve_nbd(int threads)
 	pthread_create(&t, NULL, sig_thread, &stop_set);
 	if (cratio)
 		pthread_create(&t, NULL, stat_thread, NULL);
+	if (counting)
+		pthread_create(&t, NULL, count_thread, NULL);
 	harden();
 
 	fprintf(stderr, "vroom: serving %llu MiB on %s (nbd, %d threads)\n",
@@ -1207,9 +1345,12 @@ static void serve_ublk(int threads)
 		(unsigned long long)(dev_size / MiB), dev_path, threads);
 
 	pthread_create(&ts, NULL, sig_thread, &stop_set);
-	if (cratio) {
+	if (cratio || counting) {
 		pthread_t tstat;
-		pthread_create(&tstat, NULL, stat_thread, NULL);
+		if (cratio)
+			pthread_create(&tstat, NULL, stat_thread, NULL);
+		if (counting)
+			pthread_create(&tstat, NULL, count_thread, NULL);
 	}
 	pthread_join(ts, NULL);
 	ublk_ctrl(UBLK_U_CMD_STOP_DEV, NULL, 0, 0);
@@ -1405,6 +1546,15 @@ static void selftest(int threads)
 	printf("4K random read    %7.0f IOPS  (%.1f us each, direct VRAM copy, no socket)\n",
 	       RAND_OPS / dr, dr / RAND_OPS * 1e6);
 
+	if (counting) { /* the same page to three blocks, with a read in between: one duplicate, one bounce */
+		uint64_t d = cn.duplicate, bo = cn.bounced;
+		fill(a, BLK, 0xC0FFEE);
+		if (nbd_io(fd, NBD_CMD_WRITE, 0, a, BLK) || nbd_io(fd, NBD_CMD_WRITE, BLK, a, BLK) ||
+		    nbd_io(fd, NBD_CMD_READ, BLK, b, BLK) || nbd_io(fd, NBD_CMD_WRITE, 2 * BLK, a, BLK) ||
+		    cn.duplicate != d + 1 || cn.bounced != bo + 1)
+			die("selftest: repeat counters are wrong");
+		printf("repeat counters       ok\n");
+	}
 	for (int i = 0; i < threads; i++) {
 		struct nbd_req rq = { htobe32(NBD_REQUEST_MAGIC), htobe32(NBD_CMD_DISC), 0, 0, 0 };
 		wr_full(fds[i], &rq, sizeof rq, 0);
@@ -1421,7 +1571,7 @@ static void pattern(char *p, uint64_t blk, unsigned ver)
 {
 	uint64_t x = (blk + 1) * 0x9E3779B97F4A7C15ULL ^ (ver + 1) * 0xD6E8FEB86659FD93ULL;
 	x ^= x >> 29, x *= 0xBF58476D1CE4E5B9ULL, x ^= x >> 32, x |= 1;
-	unsigned kind = ver == 255 ? 1 : x % 8;
+	unsigned kind = ver == 255 ? 1 : (x >> 3) % 8;
 	size_t q = kind == 1 ? BLK : (256 + (x >> 8) % 1792) & ~7UL;
 
 	if (!kind) {
@@ -1658,6 +1808,10 @@ int main(int argc, char **argv)
 	if (!test)
 		block_stop_signals();
 	vram_init(gpu, size_mib);
+	if (getenv("VROOM_COUNT") && atoi(getenv("VROOM_COUNT"))) {
+		cn_init();
+		counting = 1;
+	}
 	if (test && cratio)
 		selftest_compress(threads);
 	else if (test)
@@ -1668,5 +1822,7 @@ int main(int argc, char **argv)
 		serve_nbd(threads);
 	if (spill_path)
 		unlink(spill_path);
+	if (counting && test)
+		count_print(stdout);
 	return 0;
 }
