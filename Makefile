@@ -22,6 +22,9 @@ install: all
 	install -Dm644 vroom@.service $(DESTDIR)$(UNITDIR)/vroom@.service
 	install -d $(DESTDIR)/etc/vroom
 
+uninstall:
+	rm -f $(DESTDIR)$(SBINDIR)/vroom $(DESTDIR)$(SBINDIR)/vroomctl $(DESTDIR)$(UNITDIR)/vroom@.service
+
 # Binary .deb built straight with dpkg-deb; needs no debhelper.
 deb:
 	rm -rf $(DEBROOT)
@@ -37,4 +40,4 @@ clean:
 	rm -rf vroom vroom@.service build *.deb
 
 FORCE:
-.PHONY: all install deb clean FORCE
+.PHONY: all install uninstall deb clean FORCE

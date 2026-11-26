@@ -22,18 +22,66 @@ about 4 µs of every page is the NVIDIA driver performing the copy.
 ## Requirements
 
 - Linux with systemd and the `nbd` module, or `ublk_drv` (kernel 6.0+) for the ublk backend
-- The proprietary NVIDIA driver, loaded for the card you want to use
+- NVIDIA's own driver (with either its proprietary or its open kernel
+  modules; not nouveau), loaded for the card you want to use
 - gcc and make to build
+
+Tested on Ubuntu 26.04 with kernel 7.0 and NVIDIA driver 595 (open kernel
+modules): in daily use as swap on an RTX 3070, and the self-test on an RTX 4090.
 
 ## Install
 
 ```bash
+git clone https://github.com/Vitund-AI/vroom.git
+```
+
+```bash
+cd vroom
+```
+
+On Debian and Ubuntu, build a package and install it:
+
+```bash
 make deb
+```
+
+```bash
 sudo apt install ./vroom_*.deb
 ```
 
-Or without packaging: `sudo make install` (to `/usr/local`), then
-`sudo systemctl daemon-reload`.
+On any other distribution, install straight to `/usr/local`:
+
+```bash
+sudo make install
+```
+
+```bash
+sudo systemctl daemon-reload
+```
+
+Run `vroomctl selftest` before adding a device: it needs no root, changes
+nothing, and tells you at once whether the driver and card are usable.
+
+### Upgrade
+
+Install the new package, or run `sudo make install` again. Devices that are
+running keep the old daemon until they are next stopped and started, so
+nothing in use is disturbed.
+
+### Uninstall
+
+```bash
+sudo apt remove vroom
+```
+
+This stops every device first, and refuses to go on if one is busy, so that
+nothing holding live data is cut off. `apt purge` also deletes the device
+definitions in `/etc/vroom`. After a `make install`, remove each device with
+`sudo vroomctl remove NAME`, then:
+
+```bash
+sudo make uninstall
+```
 
 ## Use
 
@@ -68,6 +116,10 @@ swap         active    /dev/ublkb0    5000 MiB  swap, priority 100, 0 MiB used
 - `--size MiB` defaults to all free VRAM less 256 MiB.
 - `--backend ublk|nbd` picks the kernel interface; ublk is used when the
   kernel has it.
+- `--gpu N` picks the card on a machine with several (default 0). N is
+  CUDA's index, which by default puts the fastest card first and so can
+  differ from the order `nvidia-smi` and `vroomctl list` show.
+  `vroomctl selftest --gpu N` names the card it used.
 - `--boot` recreates the device at every boot. **Contents never survive a stop
   or reboot**: swap and filesystems are made fresh each time.
 
@@ -80,6 +132,20 @@ test that is safe on a live device.
 
 To move pages that are already in disk swap over to the VRAM, cycle the disk
 swap: `swapoff /swap.img && swapon /swap.img`.
+
+## If it does not work
+
+- **`vroomctl selftest` fails:** the NVIDIA driver is not loaded for that
+  card, or `libcuda.so.1` is missing. `nvidia-smi` should list the card; if
+  it does not, fix the driver first.
+- **`could not start NAME; nothing was added`:** the daemon's reason is in
+  `journalctl -u vroom@NAME`. Most often the card does not have that much
+  free VRAM, so try a smaller `--size`.
+- **No ublk:** kernels before 6.0, and some built without `ublk_drv`, only
+  have NBD. vroom falls back to it by itself; `--backend nbd` forces it.
+- **`NAME is still in use; nothing was stopped`:** something has files open
+  on the mount, or there is not enough RAM and other swap to take the pages
+  back. Free one or the other and try again.
 
 ## Things that will hurt
 
