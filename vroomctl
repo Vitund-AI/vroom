@@ -287,8 +287,8 @@ stats)
 		function rate(b) { return b < 1 ? "-" : size(b) "/s" }
 		function count(n) {
 			if (n < 10000) return sprintf("%d", n)
-			if (n < 1e7) return sprintf("%.3g k", n / 1e3)
-			if (n < 1e10) return sprintf("%.3g M", n / 1e6)
+			if (n < 999500) return sprintf("%.3g k", n / 1e3)
+			if (n < 999500000) return sprintf("%.3g M", n / 1e6)
 			return sprintf("%.3g G", n / 1e9)
 		}
 		function took(ns) {
