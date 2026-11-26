@@ -264,6 +264,19 @@ kernel swap ──► /dev/nbd0   ──► socketpair ──┐
   serialises copies within a context, so one queue is fastest; several queues
   were measurably slower.
 
+## Roadmap
+
+Ideas, not promises:
+
+- **Encrypt what is stored**, on the card and in the spill file, with a key
+  that exists only in the daemon's memory, so that nothing readable is left
+  behind in a spill file, a suspend image or a card handed to a VM.
+- **Keep one copy of identical pages.** `VROOM_COUNT=1` exists to find out
+  how often that would help.
+- **Learn the water marks** for spilling instead of fixing them at 90% and 70%.
+- **Do not hold up other reads** while one waits for the spill file.
+- **GPUs other than NVIDIA's**, through Vulkan or OpenCL.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
