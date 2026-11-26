@@ -155,7 +155,10 @@ sudo vroomctl add swap --spill /var/lib --ratio 2.2      # 2.2x, overflowing to 
 
 `--compress` runs every page through zstd on its way to the card (using
 `libzstd.so.1`, which systemd already depends on) and offers a device larger
-than the VRAM behind it. Pages with identical contents are stored once.
+than the VRAM behind it. Pages with identical contents are stored once: each
+page gets a keyed 128-bit fingerprint, and one whose fingerprint is already
+held just points at that copy, whether it is on the card or in the spill
+file.
 What is stored is encrypted with AES-256-GCM (from `libcrypto.so.3`) under a
 key made up when the device starts and kept only in the daemon's memory, so
 nothing readable is left on the card or in a spill file afterwards, and a
@@ -184,10 +187,10 @@ that it takes 2.8x less room:
 
 | | Plain | Compressed |
 |---|---|---|
-| Sequential write | 4,100 MiB/s | 570 MiB/s |
-| Sequential read | 3,550 MiB/s | 920 MiB/s |
-| 4K random write | 9.5 µs | 14.6 µs |
-| 4K random read | 9.0 µs | 11.3 µs |
+| Sequential write | 4,100 MiB/s | 660 MiB/s |
+| Sequential read | 3,550 MiB/s | 880 MiB/s |
+| 4K random write | 9.5 µs | 13.5 µs |
+| 4K random read | 9.0 µs | 11.0 µs |
 
 With six in ten pages on an NVMe SSD, random reads averaged 68 µs for one
 reader, and four readers together got 3.6 times as many done: a read waiting
@@ -198,13 +201,15 @@ count, in `/run/vroom/DEVICE.count`, how many pages written were already held
 somewhere on the device. It changes nothing else; it is there to find out
 whether keeping a single copy would be worth building.
 
-Limits to know about: it costs 32 bytes of RAM per page offered (8 MiB per
-GiB) and 32 bytes of VRAM per page stored; plain devices are not encrypted; a page is only matched against copies still in VRAM, not ones that
-have moved to the spill file; the two water marks are fixed, not learned; and "oldest" is by when a
-page was last written or last moved. It has had the self-test and one live
-run as swap (3 GiB of incompressible pages pushed out of a memory-limited
-process, a third of them onto disk, all read back intact), not months of
-daily use: treat it as experimental.
+Limits to know about: it costs 40 bytes of RAM per page offered (10 MiB per
+GiB) and 32 bytes of VRAM per page stored; plain devices are not encrypted;
+two pages are taken to be identical on the strength of their fingerprints,
+without comparing them (a false match is about as likely as guessing a
+128-bit key); the two water marks are fixed, not learned; and "oldest" is by
+when a page was last written or last moved. It has had the self-test and a
+few live runs as swap (gigabytes of pages pushed out of a memory-limited
+process, part of them onto disk, all read back intact), not months of daily
+use: treat it as experimental.
 
 `vroomctl stop NAME` and `start NAME` release and reclaim the VRAM without
 forgetting the definition, e.g. to lend the GPU to something else. `remove`
@@ -296,13 +301,11 @@ Ideas, not promises, in the order they are likely to be done:
    pages to the spill file and release whole 256 MiB allocations, taking
    them back later. It can only keep room free in advance: an allocation by
    another program fails at once, with no chance to make room for it.
-4. **Match pages against copies that have spilled**, not only those still on
-   the card, if real use shows sharing being lost that way.
-5. **Learn the water marks** for spilling instead of fixing them at 90% and
+4. **Learn the water marks** for spilling instead of fixing them at 90% and
    70%, if real use shows the fixed ones to be wrong.
-6. **Encrypt plain devices too.** Only the compressed store is encrypted.
-7. **GPUs other than NVIDIA's**, through Vulkan or OpenCL.
-8. A `--help` for `vroomctl`, a CI build, packages other than `.deb`.
+5. **Encrypt plain devices too.** Only the compressed store is encrypted.
+6. **GPUs other than NVIDIA's**, through Vulkan or OpenCL.
+7. A `--help` for `vroomctl`, a CI build, packages other than `.deb`.
 
 ## License
 
