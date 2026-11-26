@@ -239,7 +239,7 @@ list | status)
 			;;
 		raw) use="raw, /dev/vroom/$name" ;;
 		esac
-		if [ "$state" = active ] && [ -r "/run/vroom/$kname.stat" ]; then
+		if [ "$state" = active ] && grep -qs '^COMPRESSED=1' "/run/vroom/$kname.stat"; then
 			use="$use; $(. "/run/vroom/$kname.stat"; awk -v p="$PAGES" -v b="$STORED_BYTES" \
 				-v v="$VRAM_BYTES" -v s="$SPILLED_BYTES" -v r="$REFUSED" 'BEGIN {
 				if (b + s < 1048576) printf "compressing, nearly empty"
@@ -273,7 +273,7 @@ stats)
 		if is_swap; then
 			awk -v d="$DEV" '$1 == d { printf "  swap     %10.0f MiB used of %.0f\n", $4 / 1024, $3 / 1024 }' /proc/swaps
 		fi
-		if [ -r "/run/vroom/$kname.stat" ]; then
+		if grep -qs '^COMPRESSED=1' "/run/vroom/$kname.stat"; then
 			(. "/run/vroom/$kname.stat"; awk -v p="$PAGES" -v b="$STORED_BYTES" -v v="$VRAM_BYTES" \
 				-v s="$SPILLED_BYTES" -v r="$REFUSED" -v n="${RECORDS:-0}" 'BEGIN { m = 1048576
 				printf "  holding  %10.0f MiB of pages in %.0f MiB of VRAM", p * 4096 / m, b / m
@@ -282,6 +282,20 @@ stats)
 				printf "\n  VRAM     %9d%% full\n", b * 100 / v
 				if (p && n) printf "  sharing  %9.1f%% of pages are a second copy of another\n", (p - n) * 100 / p
 				if (r) printf "  REFUSED  %10d writes: the store was full\n", r }')
+		fi
+		if grep -qs '^VRAM_READ_OPS=' "/run/vroom/$kname.stat"; then
+			# the daemon times one copy in 16; these are the latest it has
+			(. "/run/vroom/$kname.stat"; awk \
+				-v a="$VRAM_READ_OPS $VRAM_READ_US $VRAM_READ_KIB $VRAM_READ_MIBS $VRAM_WRITE_OPS $VRAM_WRITE_US $VRAM_WRITE_KIB $VRAM_WRITE_MIBS" \
+				-v d="$DISK_READ_OPS $DISK_READ_US $DISK_READ_KIB $DISK_READ_MIBS $DISK_WRITE_OPS $DISK_WRITE_US $DISK_WRITE_KIB $DISK_WRITE_MIBS" '
+				function one(dir, n, us, kib, mibs) {
+					if (!n) return
+					printf "    %-5s %8.1f us a copy of %d KiB on average, %d MiB/s\n", dir, us, kib, mibs }
+				function both(what, s,   f) { split(s, f, " ")
+					if (!(f[1] + f[5])) return
+					print "  " what ", latest speeds"
+					one("read", f[1], f[2], f[3], f[4]); one("write", f[5], f[6], f[7], f[8]) }
+				BEGIN { both("VRAM", a); both("spill file", d) }')
 		fi
 		if [ -r "/run/vroom/$kname.count" ]; then
 			(. "/run/vroom/$kname.count"; awk -v w="$WRITES" -v z="$ZERO" -v sb="$SAME_BLOCK" \

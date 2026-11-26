@@ -160,8 +160,46 @@ static void vram_init(int gpu, uint64_t size_mib)
 		cs_init();
 }
 
+/*
+ * How fast the card and the spill file are being, for 'vroomctl stats'. One
+ * copy in SAMPLE is timed: reading the clock costs about a hundredth of the
+ * quickest copy, so even that much is caution. Everything is counted.
+ */
+#define SAMPLE 16
+enum { P_VRAM_READ, P_VRAM_WRITE, P_DISK_READ, P_DISK_WRITE, P_KINDS };
+static struct perf {
+	uint64_t ops, bytes;		 /* all of them */
+	uint64_t t_ops, t_bytes, t_ns;	 /* the ones that were timed */
+} perf[P_KINDS];
+
+static uint64_t now_ns(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+/* Count an operation; returns the time if this one is to be timed, else 0. */
+static uint64_t perf_begin(int kind, size_t len)
+{
+	__atomic_add_fetch(&perf[kind].bytes, len, __ATOMIC_RELAXED);
+	return __atomic_fetch_add(&perf[kind].ops, 1, __ATOMIC_RELAXED) % SAMPLE ? 0 : now_ns();
+}
+
+static void perf_end(int kind, size_t len, uint64_t t0)
+{
+	if (!t0)
+		return;
+	__atomic_add_fetch(&perf[kind].t_ns, now_ns() - t0, __ATOMIC_RELAXED);
+	__atomic_add_fetch(&perf[kind].t_bytes, len, __ATOMIC_RELAXED);
+	__atomic_add_fetch(&perf[kind].t_ops, 1, __ATOMIC_RELAXED);
+}
+
 static int vram_rw(int wr, uint64_t off, char *buf, size_t len)
 {
+	size_t whole = len;
+	uint64_t t0 = perf_begin(wr ? P_VRAM_WRITE : P_VRAM_READ, len);
+
 	while (len) {
 		uint64_t ci = off / CHUNK, co = off % CHUNK;
 		size_t n = len < CHUNK - co ? len : CHUNK - co;
@@ -173,6 +211,7 @@ static int vram_rw(int wr, uint64_t off, char *buf, size_t len)
 		}
 		off += n, buf += n, len -= n;
 	}
+	perf_end(wr ? P_VRAM_WRITE : P_VRAM_READ, whole, t0);
 	return 0;
 }
 
@@ -629,6 +668,9 @@ static size_t survivors(const char *src, uint32_t v, char *dst, size_t out, size
 
 static int spill_io(int wr, char *buf, size_t len, uint64_t off)
 {
+	size_t whole = len;
+	uint64_t t0 = perf_begin(wr ? P_DISK_WRITE : P_DISK_READ, len);
+
 	while (len) {
 		ssize_t n = wr ? pwrite(spill_fd, buf, len, off) : pread(spill_fd, buf, len, off);
 		if (n <= 0) {
@@ -640,6 +682,7 @@ static int spill_io(int wr, char *buf, size_t len, uint64_t off)
 		}
 		buf += n, len -= n, off += n;
 	}
+	perf_end(wr ? P_DISK_WRITE : P_DISK_READ, whole, t0);
 	return 0;
 }
 
@@ -1136,9 +1179,12 @@ static void *count_thread(void *arg)
 /* While serving: keep /run/vroom/DEVICE.stat current for 'vroomctl list', and warn when nearly full. */
 static void *stat_thread(void *arg)
 {
+	static const char *kind[P_KINDS] = { "VRAM_READ", "VRAM_WRITE", "DISK_READ", "DISK_WRITE" };
 	char path[128], tmp[136];
 	const char *base = strrchr(dev_path, '/');
 	uint64_t last = ~0ULL;
+	struct perf was[P_KINDS] = { 0 };
+	double us[P_KINDS] = { 0 }, mibs[P_KINDS] = { 0 }, kib[P_KINDS] = { 0 };
 	int warned = 0;
 
 	(void)arg;
@@ -1152,6 +1198,7 @@ static void *stat_thread(void *arg)
 		uint64_t held = (uint64_t)(cs.nseg - cs.nfree) * SEG;
 		pthread_mutex_unlock(&cs.lock);
 		int pct = bytes * 100 / phys_size;
+		uint64_t sum = pages + bytes + refused + sbytes * 3;
 
 		if (spill_fd >= 0)
 			pct = spill_size ? sbytes * 100 / spill_size : 0;
@@ -1160,17 +1207,35 @@ static void *stat_thread(void *arg)
 					"writes will fail when it is full\n",
 				spill_fd >= 0 ? "spill file" : "VRAM", pct);
 		warned = pct >= 90 ? 1 : pct < 80 ? 0 : warned;
-		if (pages + bytes + refused + sbytes * 3 == last)
+		/* speeds over the copies timed since last time; with none, the last known stand */
+		for (int k = 0; k < P_KINDS; k++) {
+			struct perf p = perf[k];
+			uint64_t n = p.t_ops - was[k].t_ops, ns = p.t_ns - was[k].t_ns;
+			if (n && ns) {
+				us[k] = ns / 1e3 / n;
+				mibs[k] = (p.t_bytes - was[k].t_bytes) / (double)MiB / (ns / 1e9);
+				kib[k] = (p.t_bytes - was[k].t_bytes) / 1024.0 / n;
+			}
+			was[k] = p;
+			sum += p.ops * (k + 5);
+		}
+		if (sum == last)
 			continue;
-		last = pages + bytes + refused + sbytes * 3;
+		last = sum;
 		FILE *f = fopen(tmp, "w");
 		if (!f)
 			continue;
-		fprintf(f, "PAGES=%llu\nSTORED_BYTES=%llu\nSEGMENT_BYTES=%llu\nVRAM_BYTES=%llu\nREFUSED=%llu\n"
-			   "SPILLED_BYTES=%llu\nSPILL_BYTES=%llu\nRECORDS=%llu\n",
-			(unsigned long long)pages, (unsigned long long)bytes, (unsigned long long)held,
-			(unsigned long long)phys_size, (unsigned long long)refused,
-			(unsigned long long)sbytes, (unsigned long long)spill_size, (unsigned long long)recs);
+		if (cratio)
+			fprintf(f, "COMPRESSED=1\nPAGES=%llu\nSTORED_BYTES=%llu\nSEGMENT_BYTES=%llu\nREFUSED=%llu\n"
+				   "SPILLED_BYTES=%llu\nSPILL_BYTES=%llu\nRECORDS=%llu\n",
+				(unsigned long long)pages, (unsigned long long)bytes, (unsigned long long)held,
+				(unsigned long long)refused, (unsigned long long)sbytes,
+				(unsigned long long)spill_size, (unsigned long long)recs);
+		fprintf(f, "VRAM_BYTES=%llu\n", (unsigned long long)phys_size);
+		for (int k = 0; k < P_KINDS; k++)
+			fprintf(f, "%s_OPS=%llu\n%s_MIB=%llu\n%s_US=%.1f\n%s_MIBS=%.0f\n%s_KIB=%.0f\n", kind[k],
+				(unsigned long long)was[k].ops, kind[k], (unsigned long long)(was[k].bytes / MiB),
+				kind[k], us[k], kind[k], mibs[k], kind[k], kib[k]);
 		fclose(f);
 		rename(tmp, path);
 	}
@@ -1387,8 +1452,7 @@ static void serve_nbd(int threads)
 		close(sp[0]); /* the kernel holds its own reference */
 	}
 	pthread_create(&t, NULL, sig_thread, &stop_set);
-	if (cratio)
-		pthread_create(&t, NULL, stat_thread, NULL);
+	pthread_create(&t, NULL, stat_thread, NULL);
 	if (counting)
 		pthread_create(&t, NULL, count_thread, NULL);
 	harden();
@@ -1751,13 +1815,10 @@ static void serve_ublk(int threads)
 		(unsigned long long)(dev_size / MiB), dev_path, threads);
 
 	pthread_create(&ts, NULL, sig_thread, &stop_set);
-	if (cratio || counting) {
-		pthread_t tstat;
-		if (cratio)
-			pthread_create(&tstat, NULL, stat_thread, NULL);
-		if (counting)
-			pthread_create(&tstat, NULL, count_thread, NULL);
-	}
+	pthread_t tstat;
+	pthread_create(&tstat, NULL, stat_thread, NULL);
+	if (counting)
+		pthread_create(&tstat, NULL, count_thread, NULL);
 	pthread_join(ts, NULL);
 	ublk_ctrl(UBLK_U_CMD_STOP_DEV, NULL, 0, 0);
 	for (int i = 0; i < threads; i++)
@@ -2275,6 +2336,15 @@ int main(int argc, char **argv)
 		serve_nbd(threads);
 	if (spill_path)
 		unlink(spill_path);
+	if (test) {
+		static const char *what[P_KINDS] = { "VRAM read", "VRAM write", "disk read", "disk write" };
+		for (int k = 0; k < P_KINDS; k++)
+			if (perf[k].t_ops)
+				printf("%-10s %9.1f us a copy of %.0f KiB on average, %6.0f MiB/s  (%llu copies, 1 in %d timed)\n",
+				       what[k], perf[k].t_ns / 1e3 / perf[k].t_ops, perf[k].t_bytes / 1024.0 / perf[k].t_ops,
+				       perf[k].t_bytes / (double)MiB / (perf[k].t_ns / 1e9),
+				       (unsigned long long)perf[k].ops, SAMPLE);
+	}
 	if (counting && test)
 		count_print(stdout);
 	return 0;
