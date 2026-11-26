@@ -7,7 +7,7 @@ if [ "$1" = remove ] && [ -d /run/systemd/system ]; then
 	for conf in /etc/vroom/*.conf; do
 		[ -e "$conf" ] || continue
 		name=$(basename "$conf" .conf)
-		systemctl disable "vroom@$name.service" >/dev/null 2>&1 || true
 		vroomctl stop "$name" --force
+		systemctl disable "vroom@$name.service" >/dev/null 2>&1 || true
 	done
 fi

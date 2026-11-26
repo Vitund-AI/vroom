@@ -1,6 +1,8 @@
 [Unit]
 Description=VRAM-backed block device %i (vroom)
-After=nvidia-persistenced.service
+# After the disk swap: units stop in the reverse order, so at shutdown our
+# swapoff runs while the disk swap is still there to take the pages.
+After=nvidia-persistenced.service swap.target
 
 [Service]
 Type=exec
@@ -24,6 +26,7 @@ OOMScoreAdjust=-1000
 # The daemon rules out core dumps itself; this is the same from outside.
 LimitCORE=0
 LimitMEMLOCK=infinity
+NoNewPrivileges=yes
 
 [Install]
 WantedBy=multi-user.target

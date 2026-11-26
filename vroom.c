@@ -4,8 +4,9 @@
  *
  * VRAM is allocated through the driver's own CUDA library (libcuda.so.1,
  * shipped with the NVIDIA driver; no CUDA toolkit needed) and served to the
- * kernel as /dev/nbdN over in-process socketpairs speaking the NBD
- * transmission protocol. Every block I/O is one host<->device copy across PCIe.
+ * kernel as /dev/ublkbN through io_uring, or as /dev/nbdN over in-process
+ * socketpairs speaking the NBD transmission protocol. Every block I/O is one
+ * host<->device copy across PCIe.
  *
  *   vroom --selftest [--size MiB]          integrity + speed test, no root
  *   vroom --dev /dev/ublkb0 [--size MiB]   serve the device (root)
@@ -26,6 +27,7 @@
 #include <stddef.h>
 #include <sys/syscall.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -92,6 +94,26 @@ static void die(const char *fmt, ...)
 	exit(1);
 }
 
+/*
+ * Something has gone wrong while serving. Say so, but not without limit: what
+ * reads our log may itself be waiting for a page from us, and a thread that
+ * blocks writing to it holds up everyone behind it.
+ */
+static int say(void)
+{
+	static uint64_t said;
+	uint64_t n = __atomic_add_fetch(&said, 1, __ATOMIC_RELAXED);
+	return n <= 20 || n % 1000 == 0;
+}
+
+static void spawn(void *(*fn)(void *), void *arg, pthread_t *out)
+{
+	pthread_t t;
+	int r = pthread_create(out ? out : &t, NULL, fn, arg);
+	if (r)
+		die("cannot start a thread: %s", strerror(r));
+}
+
 static void *sym(void *lib, const char *name)
 {
 	void *p = dlsym(lib, name);
@@ -100,8 +122,32 @@ static void *sym(void *lib, const char *name)
 	return p;
 }
 
+#ifdef FAKE_CARD
+/*
+ * A card made of ordinary memory, for 'make check': everything above the
+ * eleven driver calls can then be tested, under the sanitizers, on a machine
+ * with no GPU. Never part of the installed program.
+ */
+static int fk_init(unsigned f) { (void)f; return 0; }
+static int fk_dev(int *d, int i) { *d = i; return 0; }
+static int fk_name(char *n, int len, int d) { (void)d; snprintf(n, len, "fake card"); return 0; }
+static int fk_ctx(CUcontext *c, unsigned f, int d) { (void)f, (void)d; *c = NULL; return 0; }
+static int fk_cur(CUcontext c) { (void)c; return 0; }
+static int fk_info(size_t *f, size_t *t) { *f = *t = (size_t)4096 * MiB; return 0; }
+static int fk_alloc(CUdeviceptr *p, size_t n) { void *m = malloc(n); *p = (uintptr_t)m; return m ? 0 : 2; }
+static int fk_host(void **p, size_t n) { return posix_memalign(p, BLK, n) ? 2 : 0; }
+static int fk_set(CUdeviceptr p, unsigned char v, size_t n) { memset((void *)(uintptr_t)p, v, n); return 0; }
+static int fk_in(CUdeviceptr d, const void *s, size_t n) { memcpy((void *)(uintptr_t)d, s, n); return 0; }
+static int fk_out(void *d, CUdeviceptr s, size_t n) { memcpy(d, (void *)(uintptr_t)s, n); return 0; }
+#endif
+
 static void vram_init(int gpu, uint64_t size_mib)
 {
+#ifdef FAKE_CARD
+	cu.Init = fk_init, cu.DeviceGet = fk_dev, cu.DeviceGetName = fk_name, cu.CtxCreate = fk_ctx;
+	cu.CtxSetCurrent = fk_cur, cu.MemGetInfo = fk_info, cu.MemAlloc = fk_alloc, cu.MemAllocHost = fk_host;
+	cu.MemsetD8 = fk_set, cu.HtoD = fk_in, cu.DtoH = fk_out;
+#else
 	void *lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
 	if (!lib)
 		die("cannot load libcuda.so.1 (is the NVIDIA driver installed?): %s", dlerror());
@@ -116,6 +162,7 @@ static void vram_init(int gpu, uint64_t size_mib)
 	cu.MemsetD8 = sym(lib, "cuMemsetD8_v2");
 	cu.HtoD = sym(lib, "cuMemcpyHtoD_v2");
 	cu.DtoH = sym(lib, "cuMemcpyDtoH_v2");
+#endif
 
 	int dev, r;
 	char name[128] = "?";
@@ -149,6 +196,8 @@ static void vram_init(int gpu, uint64_t size_mib)
 
 	uint64_t n = (phys_size + CHUNK - 1) / CHUNK;
 	chunks = calloc(n, sizeof *chunks);
+	if (!chunks)
+		die("out of memory");
 	for (uint64_t i = 0; i < n; i++) {
 		uint64_t len = phys_size - i * CHUNK < CHUNK ? phys_size - i * CHUNK : CHUNK;
 		if ((r = cu.MemAlloc(&chunks[i], len)))
@@ -186,7 +235,7 @@ static unsigned hist_bucket(uint64_t ns)
 /* A time in nanoseconds from the middle of bucket i. */
 static double hist_ns(unsigned i)
 {
-	return (double)((4 | (i & 3)) << (i / 4 + 4)) * 1.09;
+	return (double)((uint64_t)(4 | (i & 3)) << (i / 4 + 4)) * 1.09;
 }
 
 static uint64_t now_ns(void)
@@ -224,7 +273,8 @@ static int vram_rw(int wr, uint64_t off, char *buf, size_t len)
 		size_t n = len < CHUNK - co ? len : CHUNK - co;
 		int r = wr ? cu.HtoD(chunks[ci] + co, buf, n) : cu.DtoH(buf, chunks[ci] + co, n);
 		if (r) {
-			fprintf(stderr, "vroom: VRAM %s failed at offset %llu (CUDA error %d)\n",
+			if (say())
+				fprintf(stderr, "vroom: VRAM %s failed at offset %llu (CUDA error %d)\n",
 				wr ? "write" : "read", (unsigned long long)off, r);
 			return -1;
 		}
@@ -274,7 +324,8 @@ static int vram_rw(int wr, uint64_t off, char *buf, size_t len)
 #define E_LEN(e) ((uint32_t)((e) >> 40) & 0x1fff)
 #define E_MAKE(off, len) (E_VALID | (uint64_t)(len) << 40 | (off))
 #define IDX_GONE UINT32_MAX
-enum { SEG_FREE, SEG_OPEN, SEG_CLOSED, SEG_CLEANING };
+/* SEG_BAD: its record headers no longer add up; what is in it can be read but is never moved. */
+enum { SEG_FREE, SEG_OPEN, SEG_CLOSED, SEG_CLEANING, SEG_BAD };
 
 struct rec {
 	uint32_t id; /* which record this is: see cs.rloc */
@@ -334,6 +385,7 @@ static struct {
 	/* Per record. Pages with identical contents share one, so it can move without touching them. */
 	uint64_t *rloc;	 /* where it is: E_MAKE(offset, length); 0 until it has been written */
 	struct fp *rfp;	 /* fingerprint of the page it holds */
+	uint32_t *rnon;	 /* the low half of the nonce it was sealed with: see cs_read */
 	uint32_t *rref;	 /* how many pages point at it; for an unused id, the next unused one */
 	uint32_t rfree, rmax;
 	uint32_t *idx;	 /* open-addressed: hash -> a record holding that page */
@@ -359,6 +411,7 @@ static struct {
 	uint64_t held_clock, held_hits;
 	pthread_cond_t wake, room; /* work for the keeper; room made for writers */
 	int stuck;		   /* the keeper can free nothing more: the store is full */
+	int waiting;		   /* writes waiting for room */
 	uint32_t ahead;		   /* free segments the keeper tries to keep in hand */
 	uint64_t waits;		   /* writes that had to wait for it */
 	uint32_t *freelist, nseg, nfree, open;
@@ -372,7 +425,8 @@ static struct {
 
 static const char *spill_path;
 static int spill_fd = -1, spill_is_dev;
-static uint64_t spill_size;
+static uint64_t spill_size, spill_base; /* a disk starts with a label, and the segments follow it */
+static const char spill_magic[16] = "vroom spill v1\n";
 static int high_pct = 90, low_pct = 70;
 static void *keeper_thread(void *arg);
 
@@ -381,6 +435,9 @@ static __thread struct {
 	void *cc, *dc, *seal, *open, *print;
 	char *stage;
 } ct;
+
+static int page_print(const char *page, struct fp *f);
+static int rec_crypt(int seal, struct rec *r, char *data);
 
 static void ct_init(void)
 {
@@ -401,6 +458,38 @@ static void ct_init(void)
 	    ev.Init(ct.open, cipher, NULL, cipher_key, NULL, 0) != 1 ||
 	    ev.Init(ct.print, cipher, NULL, print_key, NULL, 1) != 1)
 		die("cannot set up compression and encryption");
+	/*
+	 * Use all of it once now. The libraries allocate their working memory
+	 * the first time they are used, and that must not be when the machine
+	 * is already out of memory and waiting on us.
+	 */
+	struct rec r = { .id = 0 };
+	struct fp f;
+	char *page = ct.stage, *packed = ct.stage + BLK, *back = ct.stage + 2 * BLK;
+	for (size_t i = 0; i < BLK; i++)
+		page[i] = i / 64;
+	size_t c = z.Compress(ct.cc, packed, RAW_ABOVE, page, BLK, clevel);
+	if (z.IsError(c) || !c || c > RAW_ABOVE)
+		die("cannot compress");
+	r.len = c;
+	if (page_print(page, &f) || rec_crypt(1, &r, packed) || rec_crypt(0, &r, packed) ||
+	    z.Decompress(ct.dc, back, BLK, packed, c) != BLK || memcmp(page, back, BLK))
+		die("compression and encryption do not give back what went in");
+}
+
+/* Threads that serve requests get ready before the device exists; the starter waits for them here. */
+static int threads_ready;
+static void thread_ready(void)
+{
+	if (cratio)
+		ct_init();
+	__atomic_add_fetch(&threads_ready, 1, __ATOMIC_RELEASE);
+}
+
+static void await_threads(int n)
+{
+	while (__atomic_load_n(&threads_ready, __ATOMIC_ACQUIRE) < n)
+		usleep(1000);
 }
 
 static int page_print(const char *page, struct fp *f)
@@ -487,17 +576,41 @@ static void cs_init(void)
 				    errno == EBUSY ? " (it, or a partition on it, is in use)" : "");
 			if (ioctl(spill_fd, BLKGETSIZE64, &whole) || whole < 16 * MiB)
 				die("--spill %s: cannot tell its size", spill_path);
+			/*
+			 * The first megabyte is a label saying the disk is ours, and
+			 * otherwise zeros, so that nothing takes what follows for a
+			 * filesystem. vroomctl looks for the label before every start:
+			 * a disk without one has to be empty, which is what stops a
+			 * name such as /dev/sdb that now means a different disk.
+			 */
+			spill_base = SEG;
+			whole -= spill_base;
 			if (!spill_size || spill_size > whole)
 				spill_size = dev_size < whole ? dev_size : whole;
 			spill_size &= ~(uint64_t)(SEG - 1);
-			range[1] = spill_size; /* tell an SSD that all of this is free to start with */
+			range[1] = spill_base + spill_size; /* tell an SSD that all of this is free to start with */
 			ioctl(spill_fd, BLKDISCARD, range);
+			if (posix_memalign(&p, BLK, SEG))
+				die("out of memory");
+			memset(p, 0, SEG);
+			memcpy(p, spill_magic, sizeof spill_magic);
+			if (pwrite(spill_fd, p, SEG, 0) != SEG)
+				die("--spill %s: cannot write to it: %s", spill_path, strerror(errno));
+			free(p);
 		} else {
-			spill_fd = open(spill_path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC | O_DIRECT, 0600);
-			if (spill_fd < 0 && errno == EINVAL)
-				spill_fd = open(spill_path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+			/*
+			 * A file of our own making, never one that is already there,
+			 * and with no name once it is open: it goes when we do, however
+			 * that happens. Without O_DIRECT every page moved out would
+			 * first take up memory in the page cache, which is the one
+			 * thing in short supply.
+			 */
+			spill_fd = open(spill_path, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC | O_DIRECT, 0600);
 			if (spill_fd < 0)
-				die("--spill %s: %s", spill_path, strerror(errno));
+				die("--spill %s: %s%s", spill_path, strerror(errno),
+				    errno == EEXIST ? " (if it is left over from an earlier run, remove it)" :
+				    errno == EINVAL ? " (the filesystem cannot do direct I/O; put it on a disk)" : "");
+			unlink(spill_path);
 			if (!spill_size)
 				spill_size = dev_size;
 			int r = posix_fallocate(spill_fd, 0, spill_size);
@@ -505,14 +618,16 @@ static void cs_init(void)
 				die("--spill %s: cannot reserve %llu MiB: %s", spill_path,
 				    (unsigned long long)(spill_size / MiB), strerror(r));
 		}
+		if (phys_size + spill_size >= 1ULL << 40)
+			die("VRAM and spill together must come to less than 1024 GiB");
 		cs.nspill = spill_size / SEG;
 		fprintf(stderr, "vroom: spilling to %s (%llu MiB) above %d%% full, back below %d%%\n",
 			spill_path, (unsigned long long)(spill_size / MiB), high_pct, low_pct);
 	}
 	uint32_t all = cs.nseg + cs.nspill;
 	uint64_t npages = dev_size / BLK, cap = 1;
-	/* a request's new records exist briefly alongside the ones they replace */
-	cs.rmax = npages + MAX_PAGES;
+	/* a request's new records exist briefly alongside the ones they replace, in every thread at once */
+	cs.rmax = npages + MAX_THREADS * MAX_PAGES;
 	while (cap < 2ULL * cs.rmax)
 		cap <<= 1;
 	cs.idx_mask = cap - 1;
@@ -520,6 +635,7 @@ static void cs_init(void)
 	cs.rloc = calloc(cs.rmax + 1, sizeof *cs.rloc);
 	cs.rfp = calloc(cs.rmax + 1, sizeof *cs.rfp);
 	cs.rref = calloc(cs.rmax + 1, sizeof *cs.rref);
+	cs.rnon = calloc(cs.rmax + 1, sizeof *cs.rnon);
 	cs.idx = calloc(cap, sizeof *cs.idx);
 	cs.live = calloc(all, sizeof *cs.live);
 	cs.used = calloc(all, sizeof *cs.used);
@@ -544,7 +660,7 @@ static void cs_init(void)
 	if (cu.MemAllocHost(&p, SEG) && posix_memalign(&p, BLK, SEG))
 		p = NULL;
 	cs.rebuf = p;
-	if (!cs.map || !cs.rloc || !cs.rfp || !cs.rref || !cs.idx || !cs.live || !cs.used || !cs.seq ||
+	if (!cs.map || !cs.rloc || !cs.rfp || !cs.rref || !cs.rnon || !cs.idx || !cs.live || !cs.used || !cs.seq ||
 	    !cs.pins || !cs.hits || !cs.lastoff || !cs.state || !cs.freelist || !cs.sfree || !cs.gcbuf || !cs.evbuf || !cs.rebuf)
 		die("out of memory for the compressed store's tables");
 	for (uint32_t id = 1; id <= cs.rmax; id++)
@@ -556,9 +672,9 @@ static void cs_init(void)
 		cs.sfree[cs.nsfree++] = cs.nseg + s;
 	cs.open = 0;
 	cs.state[0] = SEG_OPEN;
+	cs.seq[0] = ++cs.clock;
 	cs.ahead = cs.nseg / 32 < 4 ? 4 : cs.nseg / 32 > 64 ? 64 : cs.nseg / 32;
-	pthread_t t;
-	pthread_create(&t, NULL, keeper_thread, NULL);
+	spawn(keeper_thread, NULL, NULL);
 }
 
 static uint64_t page_hash(const char *p)
@@ -612,7 +728,7 @@ static void loc_account(uint64_t e, int add)
 	if (s >= cs.nseg)
 		cs.sbytes -= sz;
 	cs.stuck = 0; /* something has died: there may be room to be made again */
-	if (!cs.live[s] && cs.state[s] == SEG_CLOSED)
+	if (!cs.live[s] && (cs.state[s] == SEG_CLOSED || cs.state[s] == SEG_BAD))
 		seg_free(s);
 }
 
@@ -628,18 +744,30 @@ static void rec_place(uint32_t id, uint64_t e)
 
 static void idx_insert(uint32_t id)
 {
-	if (cs.idx_used * 10 > cs.idx_mask * 7) { /* mostly slots of records long gone: start again */
-		memset(cs.idx, 0, (cs.idx_mask + 1) * sizeof *cs.idx);
-		cs.idx_used = 0;
-		for (uint32_t r = 1; r <= cs.rmax; r++)
-			if (cs.rloc[r] && r != id)
-				idx_insert(r);
-	}
 	uint64_t i = cs.rfp[id].a & cs.idx_mask;
 	while (cs.idx[i] && cs.idx[i] != IDX_GONE)
 		i = (i + 1) & cs.idx_mask;
 	cs.idx_used += !cs.idx[i];
 	cs.idx[i] = id;
+}
+
+/*
+ * Make sure n more records can go into the index. When it is mostly the slots
+ * of records long gone it is started again, from the records that are written
+ * somewhere, which are exactly the ones in it. So this must be called before
+ * the new ones are written, not between writing them and putting them in:
+ * they would then go in twice, and a record that is in twice is still found,
+ * by its old contents, after it has been freed.
+ */
+static void idx_reserve(size_t n)
+{
+	if ((cs.idx_used + n) * 10 <= cs.idx_mask * 7)
+		return;
+	memset(cs.idx, 0, (cs.idx_mask + 1) * sizeof *cs.idx);
+	cs.idx_used = 0;
+	for (uint32_t r = 1; r <= cs.rmax; r++)
+		if (cs.rloc[r])
+			idx_insert(r);
 }
 
 static void idx_remove(uint32_t id)
@@ -654,7 +782,8 @@ static void idx_remove(uint32_t id)
 static uint32_t idx_find(const struct fp *f)
 {
 	for (uint64_t i = f->a & cs.idx_mask; cs.idx[i]; i = (i + 1) & cs.idx_mask)
-		if (cs.idx[i] != IDX_GONE && cs.rfp[cs.idx[i]].a == f->a && cs.rfp[cs.idx[i]].b == f->b)
+		if (cs.idx[i] != IDX_GONE && cs.rloc[cs.idx[i]] && cs.rfp[cs.idx[i]].a == f->a &&
+		    cs.rfp[cs.idx[i]].b == f->b)
 			return cs.idx[i];
 	return 0;
 }
@@ -682,6 +811,7 @@ static void rec_unref(uint32_t id)
 		loc_account(cs.rloc[id], 0);
 		cs.rloc[id] = 0;
 	}
+	cs.rfp[id] = (struct fp){ 0, 0 };
 	cs.rref[id] = cs.rfree;
 	cs.rfree = id;
 	cs.recs--;
@@ -737,6 +867,7 @@ static int log_append(const char *buf, size_t bytes)
 		for (size_t pos = 0; pos < n; pos += REC_HDR + r.len) {
 			memcpy(&r, buf + pos, sizeof r);
 			rec_place(r.id, E_MAKE(at + pos, r.len));
+			cs.rnon[r.id] = (uint32_t)r.nonce;
 		}
 		cs.used[s] += n;
 		buf += n, bytes -= n;
@@ -759,8 +890,26 @@ static size_t survivors(const char *src, uint32_t v, char *dst, size_t out, size
 	if (all)
 		*all = 1;
 	for (size_t pos = 0; pos < cs.used[v]; pos += REC_HDR + r.len) {
+		int ours;
 		memcpy(&r, src + pos, sizeof r);
-		if (r.id > cs.rmax || !cs.rloc[r.id] || E_OFF(cs.rloc[r.id]) != (uint64_t)v * SEG + pos)
+		ours = r.id && r.id <= cs.rmax && cs.rloc[r.id] && E_OFF(cs.rloc[r.id]) == (uint64_t)v * SEG + pos;
+		/*
+		 * The headers come from the card or the disk, where a bit can
+		 * flip, and one wrong length would send us through the rest of
+		 * the segment out of step. A segment like that is left where it
+		 * is: its records can still be read, each from where the tables
+		 * say it is, and nothing is lost that was not lost already.
+		 */
+		if (r.len > BLK || !r.len || pos + REC_HDR + r.len > cs.used[v] ||
+		    (ours && (r.len != E_LEN(cs.rloc[r.id]) || (uint32_t)r.nonce != cs.rnon[r.id]))) {
+			if (say())
+				fprintf(stderr, "vroom: segment %u is damaged at %zu; leaving it where it is\n", v, pos);
+			cs.state[v] = SEG_BAD;
+			if (all)
+				*all = 1; /* nothing more to be had from it: go on to the next */
+			break;
+		}
+		if (!ours)
 			continue;
 		if (out + REC_HDR + r.len > limit) {
 			if (all)
@@ -775,18 +924,25 @@ static size_t survivors(const char *src, uint32_t v, char *dst, size_t out, size
 	return out;
 }
 
+static int spill_broken; /* the self-test's way of having the disk fail */
+
 static int spill_io(int wr, char *buf, size_t len, uint64_t off)
 {
 	size_t whole = len;
 	uint64_t t0 = perf_begin(wr ? P_DISK_WRITE : P_DISK_READ, len);
 
+	if (spill_broken)
+		return -1;
+
 	while (len) {
-		ssize_t n = wr ? pwrite(spill_fd, buf, len, off) : pread(spill_fd, buf, len, off);
+		ssize_t n = wr ? pwrite(spill_fd, buf, len, spill_base + off) :
+				 pread(spill_fd, buf, len, spill_base + off);
 		if (n <= 0) {
 			if (n < 0 && errno == EINTR)
 				continue;
-			fprintf(stderr, "vroom: spill file %s failed: %s\n", wr ? "write" : "read",
-				n ? strerror(errno) : "short");
+			if (say())
+				fprintf(stderr, "vroom: spill %s failed: %s\n", wr ? "write" : "read",
+					n ? strerror(errno) : "short");
 			return -1;
 		}
 		buf += n, len -= n, off += n;
@@ -822,6 +978,8 @@ static int evict(void)
 			     (uint64_t)(slot - cs.nseg) * SEG))
 			return EIO;
 		out = survivors(cs.gcbuf, slot, cs.evbuf, 0, SEG, NULL);
+		if (cs.state[slot] == SEG_BAD)
+			return EIO; /* not all of it could be found, so it must not be written over */
 	} else { /* a free one that nobody is still reading: bring it to the top of the stack */
 		uint32_t k = cs.nsfree;
 		while (k && cs.pins[cs.sfree[k - 1]])
@@ -877,8 +1035,13 @@ static int evict(void)
 	size_t k = 0, went = 0;
 	for (size_t pos = 0; pos < out; pos += REC_HDR + r.len, k++) {
 		memcpy(&r, cs.evbuf + pos, sizeof r);
-		if (!cs.rloc[r.id] || E_OFF(cs.rloc[r.id]) != moved_from[k])
-			continue; /* gone, or gone elsewhere, while we were writing */
+		/*
+		 * Gone, or gone elsewhere, while we were writing? The nonce is
+		 * compared too: the id and the place may both have been given
+		 * to a new record in the meantime, and what we wrote is the old.
+		 */
+		if (!cs.rloc[r.id] || E_OFF(cs.rloc[r.id]) != moved_from[k] || cs.rnon[r.id] != (uint32_t)r.nonce)
+			continue;
 		rec_place(r.id, E_MAKE((uint64_t)slot * SEG + pos, r.len));
 		went += REC_HDR + r.len;
 	}
@@ -907,12 +1070,17 @@ static int clean_one(void)
 	if (vram_rw(0, (uint64_t)v * SEG, cs.gcbuf, cs.used[v]))
 		return EIO;
 	out = survivors(cs.gcbuf, v, cs.gcbuf, 0, SEG, NULL);
-	cs.state[v] = SEG_CLEANING; /* keep it out of the free list until its records have moved */
+	int whole = cs.state[v] != SEG_BAD;
+	if (whole)
+		cs.state[v] = SEG_CLEANING; /* keep it out of the free list until its records have moved */
 	int err = log_append(cs.gcbuf, out);
 	if (err) {
-		cs.state[v] = SEG_CLOSED;
+		if (whole)
+			cs.state[v] = SEG_CLOSED;
 		return err;
 	}
+	if (!whole)
+		return 0; /* what could be found has moved; the rest stays, and so does the segment */
 	seg_free(v);
 	cs.cleaned++;
 	return 0;
@@ -963,18 +1131,29 @@ static void *keeper_thread(void *arg)
 		int spill = spill_fd >= 0, err = EAGAIN;
 
 		if (spill && on_card * 100 > phys_size * high_pct) {
-			if ((err = evict()) == ENOSPC && cs.nfree < cs.ahead)
-				err = clean_one(); /* the file is full: at least tidy up */
+			if ((err = evict()) && cs.nfree < cs.ahead)
+				err = clean_one(); /* the spill is full, or failing: at least tidy up */
 		} else if (cs.nfree < cs.ahead) {
-			if ((err = clean_one()) == ENOSPC)
+			if ((err = clean_one()))
 				err = evict();
 		} else if (spill && cs.sbytes && on_card * 100 < phys_size * low_pct && cs.nfree >= 4) {
 			rehydrate();
 			err = 0;
 		}
-		if (err == ENOSPC && cs.nfree < 3)
+		/*
+		 * Nothing could be freed, whether for want of room or because the
+		 * card or the disk gave an error, and writes are waiting or soon
+		 * will be: they are refused. Waiting for ever would hang the
+		 * machine; a refused write leaves the page in memory.
+		 */
+		if (err && err != EAGAIN && (cs.nfree < 3 || cs.waiting))
 			cs.stuck = 1;
 		pthread_cond_broadcast(&cs.room);
+		if (!err) { /* let those who want the lock have it between one step and the next */
+			pthread_mutex_unlock(&cs.lock);
+			sched_yield();
+			pthread_mutex_lock(&cs.lock);
+		}
 		if (err) { /* nothing to do, or nothing that can be done: wait to be asked */
 			struct timespec until;
 			clock_gettime(CLOCK_REALTIME, &until);
@@ -1007,7 +1186,10 @@ static int make_room(size_t need)
 			return ENOSPC;
 		}
 		cs.waits += !waited++;
+		cs.waiting++;
+		pthread_cond_signal(&cs.wake);
 		pthread_cond_wait(&cs.room, &cs.lock);
+		cs.waiting--;
 	}
 }
 
@@ -1077,8 +1259,10 @@ static int cs_write(uint64_t off, const char *buf, size_t len)
 		out += REC_HDR + c;
 	}
 	pthread_mutex_lock(&cs.lock);
-	if (out && !err && !(err = make_room(out)))
+	if (out && !err && !(err = make_room(out))) {
+		idx_reserve(fresh);
 		err = log_append(ct.stage, out);
+	}
 	for (size_t i = 0; i < n; i++) {
 		if (kind[i] == ZERO) {
 			if (!err)
@@ -1100,7 +1284,7 @@ static int cs_read(uint64_t off, char *buf, size_t len)
 {
 	uint64_t lpn = off / BLK;
 	size_t n = len / BLK, in = 0, nsp = 0;
-	uint32_t pos[MAX_PAGES], clen[MAX_PAGES];
+	uint32_t pos[MAX_PAGES], clen[MAX_PAGES], non[MAX_PAGES];
 	struct {
 		uint64_t at, start, end;
 		size_t to, span;
@@ -1126,6 +1310,7 @@ static int cs_read(uint64_t off, char *buf, size_t len)
 		do {
 			pos[i] = in + (end - start) + REC_HDR;
 			clen[i] = E_LEN(e);
+			non[i] = cs.rnon[cs.map[lpn + i]];
 			end += REC_HDR + E_LEN(e);
 		} while (++i < n && (e = cs.rloc[cs.map[lpn + i]]) && E_OFF(e) == end && end != phys_size);
 		if (start < phys_size) {
@@ -1218,16 +1403,24 @@ static int cs_read(uint64_t off, char *buf, size_t len)
 			continue;
 		}
 		memcpy(&r, data - REC_HDR, sizeof r);
-		if (r.len != clen[i] || rec_crypt(0, &r, data)) {
-			fprintf(stderr, "vroom: stored page %llu has been altered or damaged\n",
-				(unsigned long long)(lpn + i));
+		/*
+		 * The nonce must be the one this page was last sealed with: a
+		 * record can be genuine and still be the wrong one, an older
+		 * writing of the same page put back by a failing disk or by
+		 * someone who can write to it.
+		 */
+		if (r.len != clen[i] || (uint32_t)r.nonce != non[i] || rec_crypt(0, &r, data)) {
+			if (say())
+				fprintf(stderr, "vroom: stored page %llu has been altered or damaged\n",
+					(unsigned long long)(lpn + i));
 			return EIO;
 		}
 		if (r.len == BLK)
 			memcpy(p, data, BLK);
 		else if (z.Decompress(ct.dc, p, BLK, data, r.len) != BLK) {
-			fprintf(stderr, "vroom: stored page %llu does not decompress\n",
-				(unsigned long long)(lpn + i));
+			if (say())
+				fprintf(stderr, "vroom: stored page %llu does not decompress\n",
+					(unsigned long long)(lpn + i));
 			return EIO;
 		}
 	}
@@ -1431,7 +1624,6 @@ static void *stat_thread(void *arg)
 	int warned = 0;
 
 	(void)arg;
-	mkdir("/run/vroom", 0755);
 	snprintf(path, sizeof path, "/run/vroom/%s.stat", base ? base + 1 : dev_path);
 	snprintf(tmp, sizeof tmp, "%s.tmp", path);
 	for (unsigned tick = 0;; tick++, sleep(TICK)) {
@@ -1447,7 +1639,7 @@ static void *stat_thread(void *arg)
 		if (pct >= 90 && !warned)
 			fprintf(stderr, "vroom: WARNING: the %s is %d%% full of compressed data; "
 					"writes will fail when it is full\n",
-				spill_fd >= 0 ? "spill file" : "VRAM", pct);
+				spill_fd >= 0 ? "spill" : "VRAM", pct);
 		warned = pct >= 90 ? 1 : pct < 80 ? 0 : warned;
 
 		struct perf *cur = ring[tick % KEPT];
@@ -1461,6 +1653,7 @@ static void *stat_thread(void *arg)
 		FILE *f = fopen(tmp, "w");
 		if (!f)
 			continue;
+		fchmod(fileno(f), 0600); /* how many pages share a copy says something about what they hold */
 		if (cratio)
 			fprintf(f, "COMPRESSED=1\nPAGES=%llu\nSTORED_BYTES=%llu\nSEGMENT_BYTES=%llu\nREFUSED=%llu\n"
 				   "SPILLED_BYTES=%llu\nSPILL_BYTES=%llu\nRECORDS=%llu\nWAITS=%llu\n",
@@ -1548,6 +1741,7 @@ static void *worker(void *arg)
 	char *buf = vbuf;
 	/* We sit in the swap-out path: our allocations must not wait on I/O. */
 	prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0);
+	thread_ready();
 
 	for (;;) {
 		struct nbd_req rq;
@@ -1560,7 +1754,7 @@ static void *worker(void *arg)
 		uint32_t cmd = be32toh(rq.type) & 0xffff, len = be32toh(rq.len);
 		uint64_t off = be64toh(rq.from);
 		struct nbd_rep rp = { htobe32(NBD_REPLY_MAGIC), 0, rq.cookie };
-		int err = off + len > dev_size ? EINVAL : 0;
+		int err = off > dev_size || len > dev_size - off ? EINVAL : 0;
 		size_t n;
 
 		switch (cmd) {
@@ -1633,6 +1827,19 @@ static int listed_in(const char *file)
 	return hit;
 }
 
+/*
+ * Is something using the device that the two lists do not show: a partition
+ * on it, LVM or dm-crypt on top of it? The kernel refuses an exclusive open
+ * of a device that anything has claimed.
+ */
+static int held_open(void)
+{
+	int fd = open(dev_path, O_RDONLY | O_EXCL | O_CLOEXEC);
+	if (fd >= 0)
+		close(fd);
+	return fd < 0 && errno == EBUSY;
+}
+
 /* Returns once a stop signal arrives while the device holds nothing live. */
 static void *sig_thread(void *arg)
 {
@@ -1640,11 +1847,12 @@ static void *sig_thread(void *arg)
 	int sig;
 	for (;;) {
 		sigwait(set, &sig);
-		int sw = listed_in("/proc/swaps");
-		if (sw || listed_in("/proc/mounts")) {
-			fprintf(stderr, "vroom: ignoring signal %d: %s is %s. Run '%s %s' first.\n",
-				sig, dev_path, sw ? "active swap" : "mounted",
-				sw ? "swapoff" : "umount", dev_path);
+		int sw = listed_in("/proc/swaps"), mnt = !sw && listed_in("/proc/mounts");
+		if (sw || mnt || held_open()) {
+			fprintf(stderr, "vroom: ignoring signal %d: %s is %s. %s%s%s first.\n", sig, dev_path,
+				sw ? "active swap" : mnt ? "mounted" : "in use",
+				sw ? "Run 'swapoff " : mnt ? "Run 'umount " : "Release it",
+				sw || mnt ? dev_path : "", sw || mnt ? "'" : "");
 			continue;
 		}
 		if (nbd_fd >= 0)
@@ -1656,10 +1864,16 @@ static void *sig_thread(void *arg)
 static sigset_t stop_set;
 static void block_stop_signals(void)
 {
+	/* Every signal that would otherwise end us on the spot, not only the usual two. */
 	sigemptyset(&stop_set);
 	sigaddset(&stop_set, SIGINT);
 	sigaddset(&stop_set, SIGTERM);
+	sigaddset(&stop_set, SIGHUP);
+	sigaddset(&stop_set, SIGQUIT);
+	sigaddset(&stop_set, SIGUSR1);
+	sigaddset(&stop_set, SIGUSR2);
 	pthread_sigmask(SIG_BLOCK, &stop_set, NULL);
+	signal(SIGPIPE, SIG_IGN);
 }
 
 /* We sit in the kernel's swap-out path: stay resident and never be the OOM victim. */
@@ -1672,6 +1886,18 @@ static void harden(void)
 	FILE *f = fopen("/proc/self/oom_score_adj", "w");
 	if (f) {
 		fputs("-1000", f);
+		fclose(f);
+	}
+	/* A log that is not being read must lose lines, not stop us (when it is the journal's socket). */
+	struct stat st;
+	if (!fstat(2, &st) && S_ISSOCK(st.st_mode))
+		fcntl(2, F_SETFL, fcntl(2, F_GETFL) | O_NONBLOCK);
+	/* Tell vroomctl the device is this process's, and may be put to use. */
+	char path[128];
+	const char *base = strrchr(dev_path, '/');
+	snprintf(path, sizeof path, "/run/vroom/%s.pid", base ? base + 1 : dev_path);
+	if ((f = fopen(path, "w"))) {
+		fprintf(f, "%d\n", getpid());
 		fclose(f);
 	}
 }
@@ -1704,13 +1930,14 @@ static void serve_nbd(int threads)
 			die("socketpair: %s", strerror(errno));
 		if (ioctl(nbd_fd, NBD_SET_SOCK, sp[0]))
 			die("NBD_SET_SOCK: %s (device busy?)", strerror(errno));
-		pthread_create(&t, NULL, worker, (void *)(intptr_t)sp[1]);
+		spawn(worker, (void *)(intptr_t)sp[1], &t);
 		close(sp[0]); /* the kernel holds its own reference */
 	}
-	pthread_create(&t, NULL, sig_thread, &stop_set);
-	pthread_create(&t, NULL, stat_thread, NULL);
+	await_threads(threads);
+	spawn(sig_thread, &stop_set, &t);
+	spawn(stat_thread, NULL, &t);
 	if (counting)
-		pthread_create(&t, NULL, count_thread, NULL);
+		spawn(count_thread, NULL, &t);
 	harden();
 
 	fprintf(stderr, "vroom: serving %llu MiB on %s (nbd, %d threads)\n",
@@ -1844,6 +2071,7 @@ static void *slow_reader(void *arg)
 	(void)arg;
 	cu.CtxSetCurrent(ctx);
 	prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0);
+	thread_ready();
 	for (;;) {
 		pthread_mutex_lock(&slowq.lock);
 		while (!slowq.head[0] && !slowq.head[1])
@@ -1861,7 +2089,7 @@ static void *slow_reader(void *arg)
 		qdone[j->q].done = j;
 		pthread_mutex_unlock(&qdone[j->q].lock);
 		uint64_t one = 1;
-		if (write(qdone[j->q].efd, &one, sizeof one) < 0)
+		if (write(qdone[j->q].efd, &one, sizeof one) < 0 && say())
 			fprintf(stderr, "vroom: waking queue %d: %s\n", j->q, strerror(errno));
 	}
 	return NULL;
@@ -1894,6 +2122,8 @@ static void *ublk_queue(void *arg)
 
 	cu.CtxSetCurrent(ctx);
 	prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0);
+	if (cratio)
+		ct_init();
 	ring_init(&ring, 2 * UBLK_DEPTH,
 		  IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN);
 
@@ -2068,12 +2298,12 @@ static void serve_ublk(int threads)
 		usleep(100000); /* udev may still be creating the node */
 	}
 
-	for (int i = 0; cratio && i < HELPERS; i++) {
-		pthread_t t;
-		pthread_create(&t, NULL, slow_reader, NULL);
-	}
+	for (int i = 0; cratio && i < HELPERS; i++)
+		spawn(slow_reader, NULL, NULL);
+	if (cratio)
+		await_threads(HELPERS);
 	for (int i = 0; i < threads; i++)
-		pthread_create(&tq[i], NULL, ublk_queue, (void *)(intptr_t)i);
+		spawn(ublk_queue, (void *)(intptr_t)i, &tq[i]);
 	/* Returns once every queue has handed all its tags to the kernel. */
 	if ((r = ublk_ctrl(UBLK_U_CMD_START_DEV, NULL, 0, getpid())))
 		die("ublk: start: %s", strerror(-r));
@@ -2081,11 +2311,10 @@ static void serve_ublk(int threads)
 	fprintf(stderr, "vroom: serving %llu MiB on %s (ublk, %d queues)\n",
 		(unsigned long long)(dev_size / MiB), dev_path, threads);
 
-	pthread_create(&ts, NULL, sig_thread, &stop_set);
-	pthread_t tstat;
-	pthread_create(&tstat, NULL, stat_thread, NULL);
+	spawn(sig_thread, &stop_set, &ts);
+	spawn(stat_thread, NULL, NULL);
 	if (counting)
-		pthread_create(&tstat, NULL, count_thread, NULL);
+		spawn(count_thread, NULL, NULL);
 	pthread_join(ts, NULL);
 	ublk_ctrl(UBLK_U_CMD_STOP_DEV, NULL, 0, 0);
 	for (int i = 0; i < threads; i++)
@@ -2311,7 +2540,7 @@ static void pattern(char *p, uint64_t blk, unsigned ver)
 	if (kind == 2) /* one of 500 pages that turn up all over the device */
 		blk = (x >> 20) % 500, x = blk * 0x9E3779B97F4A7C15ULL | 1, q = 1024;
 
-	if (!kind) {
+	if (!kind || ver == 254) { /* 254: discarded */
 		memset(p, 0, BLK);
 		return;
 	}
@@ -2327,6 +2556,69 @@ static void pattern(char *p, uint64_t blk, unsigned ver)
 
 static uint8_t *tver;
 static char *ta, *tb;
+
+/*
+ * The store's tables must agree with each other. Checked between the stages
+ * of the self-test, with the lock held so that the keeper is between steps.
+ */
+static void cs_check(const char *when)
+{
+	uint64_t npages = dev_size / BLK, live = 0, slive = 0, placed = 0, indexed = 0, pages = 0, unused = 0;
+	uint32_t *refs = calloc(cs.rmax + 1, sizeof *refs), *sl = calloc(cs.nseg + cs.nspill, sizeof *sl);
+	uint8_t *seen = calloc(cs.rmax + 1, 1);
+	const char *bad = NULL;
+
+	pthread_mutex_lock(&cs.lock);
+	for (uint64_t p = 0; p < npages; p++)
+		if (cs.map[p])
+			refs[cs.map[p]]++, pages++;
+	for (uint64_t i = 0; i <= cs.idx_mask; i++) {
+		uint32_t id = cs.idx[i];
+		if (!id || id == IDX_GONE)
+			continue;
+		if (!cs.rloc[id])
+			bad = "the index names a record that holds nothing";
+		else if (seen[id]++)
+			bad = "a record is in the index twice";
+		indexed++;
+	}
+	for (uint32_t id = 1; id <= cs.rmax; id++) {
+		uint64_t e = cs.rloc[id];
+		if (!e) {
+			if (refs[id])
+				bad = "a page points at a record that holds nothing";
+			continue;
+		}
+		placed++;
+		if (refs[id] != cs.rref[id])
+			bad = "a record's count of pages is wrong";
+		if (!seen[id])
+			bad = "a record is missing from the index";
+		sl[E_OFF(e) / SEG] += REC_HDR + E_LEN(e);
+	}
+	for (uint32_t s = 0; s < cs.nseg + cs.nspill; s++) {
+		if (sl[s] != cs.live[s])
+			bad = "a segment's count of live bytes is wrong";
+		if (cs.live[s] && cs.state[s] == SEG_FREE)
+			bad = "a free segment holds live records";
+		live += sl[s];
+		if (s >= cs.nseg)
+			slive += sl[s];
+	}
+	for (uint32_t id = cs.rfree; id; id = cs.rref[id])
+		if (++unused > cs.rmax)
+			break;
+	if (!bad && (live != cs.bytes || slive != cs.sbytes))
+		bad = "the totals of bytes held are wrong";
+	if (!bad && (placed != cs.recs || indexed != placed || pages != cs.pages))
+		bad = "the counts of pages and records are wrong";
+	if (!bad && unused + cs.recs != cs.rmax)
+		bad = "the list of unused records is wrong";
+	pthread_mutex_unlock(&cs.lock);
+	if (bad)
+		die("selftest: %s, %s", bad, when);
+	free(refs), free(sl), free(seen);
+}
 
 static int put_pages(int fd, uint64_t blk, unsigned n, int bump)
 {
@@ -2347,11 +2639,53 @@ static void check_pages(int fd, uint64_t blk, unsigned n, const char *when)
 		die("selftest: MISMATCH %s, near block %llu", when, (unsigned long long)blk);
 }
 
+/* Several writers at once, each in its own part of the device, each checking what it wrote. */
+struct churn {
+	int fd;
+	uint64_t lo, n;
+};
+
+static void *churner(void *arg)
+{
+	struct churn *c = arg;
+	char *a = malloc(64 * BLK), *b = malloc(64 * BLK);
+	uint64_t x = 88172645463325252ULL + c->lo;
+
+	for (int i = 0; i < 400; i++) {
+		x ^= x << 13, x ^= x >> 7, x ^= x << 17;
+		unsigned cnt = 1 + (x >> 20) % 64;
+		uint64_t blk = c->lo + x % (c->n - cnt);
+		for (unsigned k = 0; k < cnt; k++) {
+			tver[blk + k] = (tver[blk + k] + 1) % 200;
+			pattern(a + k * BLK, blk + k, tver[blk + k]);
+		}
+		if (nbd_io(c->fd, NBD_CMD_WRITE, blk * BLK, a, cnt * BLK))
+			die("selftest: write failed with several writers at once");
+		if (i % 4 == 0 && nbd_io(c->fd, NBD_CMD_TRIM, (c->lo + x % (c->n - 8)) * BLK, NULL, 8 * BLK) == 0) {
+			uint64_t d = c->lo + x % (c->n - 8);
+			for (unsigned k = 0; k < 8; k++)
+				tver[d + k] = 254; /* reads as zeros */
+		}
+		x ^= x << 13, x ^= x >> 7, x ^= x << 17;
+		cnt = 1 + (x >> 20) % 64, blk = c->lo + x % (c->n - cnt);
+		for (unsigned k = 0; k < cnt; k++)
+			if (tver[blk + k] == 254)
+				memset(a + k * BLK, 0, BLK);
+			else
+				pattern(a + k * BLK, blk + k, tver[blk + k]);
+		if (nbd_io(c->fd, NBD_CMD_READ, blk * BLK, b, cnt * BLK) || memcmp(a, b, cnt * BLK))
+			die("selftest: MISMATCH with several writers at once, near block %llu", (unsigned long long)blk);
+	}
+	free(a), free(b);
+	return NULL;
+}
+
 static void check_all(int fd, const char *when)
 {
 	uint64_t npages = dev_size / BLK;
 	for (uint64_t b = 0; b < npages; b += MAX_PAGES)
 		check_pages(fd, b, npages - b < MAX_PAGES ? npages - b : MAX_PAGES, when);
+	cs_check(when);
 }
 
 static void selftest_compress(int threads)
@@ -2409,6 +2743,65 @@ static void selftest_compress(int threads)
 		break;
 	}
 
+	/*
+	 * Rewrite everything a few times, many pages to a request, then free it
+	 * all and write the same pages again: the index of fingerprints is
+	 * rebuilt somewhere in the middle of a request, and what was freed must
+	 * not be found by it afterwards.
+	 */
+	for (int round = 0; round < 4; round++)
+		for (uint64_t b = 0; b + 64 <= npages; b += 64)
+			if (put_pages(fd, b, 64, round < 3))
+				die("selftest: rewrite failed at block %llu", (unsigned long long)b);
+	check_all(fd, "after rewriting everything");
+	for (uint64_t off = 0; off < dev_size; off += 1024 * MiB) {
+		uint64_t n = dev_size - off < 1024 * MiB ? dev_size - off : 1024 * MiB;
+		if (nbd_io(fd, NBD_CMD_TRIM, off, NULL, n))
+			die("selftest: discard failed");
+	}
+	cs_check("after freeing everything");
+	for (uint64_t b = 0; b < npages; b += MAX_PAGES)
+		if (put_pages(fd, b, npages - b < MAX_PAGES ? npages - b : MAX_PAGES, 0))
+			die("selftest: write failed at block %llu", (unsigned long long)b);
+	check_all(fd, "after freeing everything and writing it again");
+	printf("rewrite and reuse     ok\n");
+
+	/* A length on the card that has rotted must cost that page and no other. */
+	for (uint64_t b = 0; b < npages; b++) {
+		uint64_t e = cs.rloc[cs.map[b]];
+		uint32_t v = E_OFF(e) / SEG;
+		uint16_t len, wrong;
+		if (!e || E_OFF(e) >= phys_size || cs.state[v] != SEG_CLOSED || cs.rref[cs.map[b]] != 1)
+			continue;
+		len = E_LEN(e), wrong = len ^ 0x40;
+		pthread_mutex_lock(&cs.lock);
+		if (vram_rw(1, E_OFF(e) + 4, (char *)&wrong, 2) || vram_rw(0, (uint64_t)v * SEG, cs.gcbuf, cs.used[v]))
+			die("selftest: could not damage a record");
+		survivors(cs.gcbuf, v, cs.gcbuf, 0, SEG, NULL);
+		int noticed = cs.state[v] == SEG_BAD;
+		pthread_mutex_unlock(&cs.lock);
+		if (!noticed || nbd_io(fd, NBD_CMD_READ, b * BLK, tb, BLK) != EIO)
+			die("selftest: a damaged record was not noticed");
+		pthread_mutex_lock(&cs.lock);
+		if (vram_rw(1, E_OFF(e) + 4, (char *)&len, 2))
+			die("selftest: could not restore a record");
+		cs.state[v] = SEG_CLOSED;
+		pthread_mutex_unlock(&cs.lock);
+		check_all(fd, "after a record's header was damaged and restored");
+		printf("damaged header        noticed; the segment is set aside, nothing else is lost\n");
+		break;
+	}
+
+	struct churn ch[MAX_THREADS];
+	for (int i = 0; i < threads; i++) {
+		ch[i] = (struct churn){ fds[i], npages / threads * i, npages / threads };
+		pthread_create(&tc[i], NULL, churner, &ch[i]);
+	}
+	for (int i = 0; i < threads; i++)
+		pthread_join(tc[i], NULL);
+	check_all(fd, "after several writers at once");
+	printf("%d writers at once     ok\n", threads);
+
 	/* Rewrite pages at random until the log has wrapped and segments have had to be cleaned. */
 	uint64_t ops = npages < 400000 ? npages : 400000;
 	t = now();
@@ -2456,7 +2849,7 @@ static void selftest_compress(int threads)
 			if (!e || E_LEN(e) != BLK || E_OFF(e) < phys_size)
 				continue;
 			pattern(ta, c, tver[c]);
-			if (pread(spill_fd, tb, 3 * BLK, fo & ~(uint64_t)(BLK - 1)) < BLK + REC_HDR ||
+			if (pread(spill_fd, tb, 3 * BLK, spill_base + (fo & ~(uint64_t)(BLK - 1))) < BLK + REC_HDR ||
 			    !memcmp(ta, tb + (fo & (BLK - 1)) + REC_HDR, BLK))
 				die("selftest: page %llu is in the spill file unencrypted", (unsigned long long)c);
 			printf("spill file            holds no plain page\n");
@@ -2507,6 +2900,7 @@ static void selftest_compress(int threads)
 			if (nbd_io(fd, NBD_CMD_TRIM, off, NULL, n))
 				die("selftest: discard failed");
 		}
+		memset(tver + half, 254, npages - half);
 		t = now();
 		cs.returned = 0;
 		while (cs.sbytes && (cs.bytes - cs.sbytes) * 100 < phys_size * low_pct && now() - t < 120)
@@ -2518,6 +2912,21 @@ static void selftest_compress(int threads)
 		printf("rehydration       %llu MiB came back from the file in %.1f s, %llu MiB left there; verified\n",
 		       (unsigned long long)(cs.returned / MiB), now() - t,
 		       (unsigned long long)(cs.sbytes / MiB));
+
+		/* The disk fails: writes must be refused once the card is full, not wait for ever. */
+		spill_broken = 1;
+		t = now();
+		for (b = half, err = 0; b + 64 <= npages && !(err = put_pages(fd, b, 64, -1)); b += 64)
+			;
+		spill_broken = 0;
+		if (err != ENOSPC && err != EIO)
+			die("selftest: with the spill failing, filling the card gave error %d", err);
+		check_all(fd, "after the spill failed and came back");
+		if (put_pages(fd, 0, 64, 1))
+			die("selftest: writes did not resume once the spill worked again");
+		check_pages(fd, 0, 64, "after the spill came back");
+		printf("failing spill     writes refused after %.1f s, nothing lost, and resumed when it came back\n",
+		       now() - t);
 	}
 
 	for (uint64_t off = 0; off < dev_size; off += 1024 * MiB) {
@@ -2580,7 +2989,7 @@ int main(int argc, char **argv)
 			    " [--size MiB] [--gpu N] [--threads N]"
 			    " [--compress RATIO [--spill FILE [--spill-size MiB]]]");
 	}
-	if (cratio && (cratio < 1 || cratio > 8))
+	if (cratio && !(cratio >= 1 && cratio <= 8))
 		die("--compress takes how much larger than the VRAM to make the device, 1 to 8 (0: off)");
 	if (spill_path && !cratio)
 		die("--spill needs --compress");
@@ -2617,6 +3026,9 @@ int main(int argc, char **argv)
 		unlink(path);
 		snprintf(path, sizeof path, "/run/vroom/%s.count", base ? base + 1 : dev_path);
 		unlink(path);
+		snprintf(path, sizeof path, "/run/vroom/%s.pid", base ? base + 1 : dev_path);
+		unlink(path);
+		mkdir("/run/vroom", 0755);
 	}
 	if (do_bench) {
 		bench(threads);
@@ -2644,8 +3056,19 @@ int main(int argc, char **argv)
 		serve_ublk(threads);
 	else
 		serve_nbd(threads);
-	if (spill_path && !spill_is_dev)
-		unlink(spill_path);
+	if (!test) {
+		char path[128];
+		const char *base = strrchr(dev_path, '/');
+		snprintf(path, sizeof path, "/run/vroom/%s.pid", base ? base + 1 : dev_path);
+		unlink(path);
+		/*
+		 * A compressed store leaves only noise behind. A plain one has
+		 * other programs' pages on the card as they were, and the next
+		 * program to be given that memory should not find them there.
+		 */
+		for (uint64_t i = 0; !cratio && i < (phys_size + CHUNK - 1) / CHUNK; i++)
+			cu.MemsetD8(chunks[i], 0, phys_size - i * CHUNK < CHUNK ? phys_size - i * CHUNK : CHUNK);
+	}
 	if (test) {
 		static const char *what[P_KINDS] = { "requests read", "requests write", "VRAM read", "VRAM write",
 						     "disk read", "disk write" };

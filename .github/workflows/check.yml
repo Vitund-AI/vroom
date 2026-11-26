@@ -1,0 +1,11 @@
+name: check
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libzstd1 libssl3t64 shellcheck
+      - run: make CFLAGS="-O2 -Wall -Wextra -Werror"
+      - run: make check
+      - run: shellcheck -S error vroomctl

@@ -162,7 +162,8 @@ file.
 What is stored is encrypted with AES-256-GCM (from `libcrypto.so.3`) under a
 key made up when the device starts and kept only in the daemon's memory, so
 nothing readable is left on the card or in a spill file afterwards, and a
-stored page that has been altered is refused instead of returned.
+stored page that has been altered, or put back as it was at an earlier
+writing, is refused instead of returned.
 `--cipher chacha20` uses ChaCha20-Poly1305, for a CPU without AES
 instructions. A
 sample of real swap from a host running several VMs compressed 2.2x, and one
@@ -179,11 +180,20 @@ so stay conservative: `--ratio` defaults to 1.5. It is not offered for
 PATH can also be a whole empty disk or partition, such as `/dev/nvme1n1`,
 which is then used directly, with no filesystem in between; it has to look
 empty (no partitions, no filesystem) and not be in use, and everything on
-it is overwritten.
+it is overwritten. vroom labels a disk it uses and checks before every
+start that the disk either carries the label or is still empty, so a name
+like `/dev/sdb` that has come to mean a different disk is refused.
+A spill file is made by the daemon, must not exist beforehand, and has no
+name while it is in use (`df` counts it, `ls` does not show it), so it is
+gone when the daemon is, however that happens. It needs a filesystem that
+can do direct I/O, which rules out tmpfs.
 When the card passes 90% full, the oldest pages move to the file; when it
 falls below 70% they come back. With the file as large as the device, which
-is the default, writes are never refused. Pages in the file are read at the
-disk's speed, so this is for the cold tail, not a replacement for the card.
+is the default, writes are not refused for want of room. If the disk itself
+fails, pages already on it are lost with it, and writes are refused once
+the card is full instead of being left to wait. Pages in the file are read
+at the disk's speed, so this is for the cold tail, not a replacement for
+the card.
 
 `vroomctl selftest --compress 1.5` on an RTX 4090, with test data that
 compresses 2.4x and in which one page in eight is a copy of another, so
@@ -205,12 +215,17 @@ count, in `/run/vroom/DEVICE.count`, how many pages written were already held
 somewhere on the device. It changes nothing else; it is there to find out
 whether keeping a single copy would be worth building.
 
-Limits to know about: it costs 40 bytes of RAM per page offered (10 MiB per
-GiB) and 32 bytes of VRAM per page stored; plain devices are not encrypted;
-two pages are taken to be identical on the strength of their fingerprints,
-without comparing them (a false match is about as likely as guessing a
-128-bit key); the two water marks are fixed, not learned; and "oldest" is by
-when a page was last written or last moved. It has had the self-test and a
+Limits to know about: it costs about 50 bytes of RAM per page offered
+(12 MiB per GiB), locked in memory, and 32 bytes of VRAM per page stored;
+plain devices are not encrypted; two pages are taken to be identical on
+the strength of their fingerprints, without comparing them (for any two
+pages the chance of a false match is below 1 in 2^95, far smaller than
+that of the hardware getting it wrong); the two water marks are fixed, not
+learned; and "oldest" is by when a page was last written or last moved.
+Storing one copy has the side channel it has everywhere (KSM, deduplicating
+filesystems): a local user who can time their own swap-outs may be able to
+tell that a page they wrote was already held for someone else. The counts
+that would show it directly are readable by root only. It has had the self-test and a
 few live runs as swap (gigabytes of pages pushed out of a memory-limited
 process, part of them onto disk, all read back intact), not months of daily
 use: treat it as experimental.
@@ -251,9 +266,21 @@ swap: `swapoff /swap.img && swapon /swap.img`.
   or the GPU goes away while a device is in use (`rmmod nvidia`, NVIDIA's
   `.run` installer, a GPU reset, passing the card to a VM), every process with
   swapped pages there takes I/O errors and dies, and mounted files are lost.
-  Always `vroomctl stop` or `remove` first. The daemon ignores SIGTERM while
-  its device is swap or mounted and the service never sends SIGKILL, but
+  Always `vroomctl stop` or `remove` first. The daemon ignores every signal
+  it can while its device is swap, mounted or held by something on top of
+  it (LVM, dm-crypt, a partition), and the service never sends SIGKILL, but
   nothing can stop a manual `kill -9`.
+- **The card stays awake.** A program holding VRAM through CUDA keeps the
+  GPU out of its lowest power states for as long as it runs. On a desktop
+  that is a few watts; on a laptop with a GPU that would otherwise power
+  down it costs battery, and vroom is probably the wrong tool there.
+- **Consumer cards have no ECC.** A compressed device notices a flipped bit
+  (the page fails its check and the read is an I/O error, not wrong data).
+  A plain device does not: it returns whatever the card holds, as a RAM
+  disk on non-ECC memory would.
+- **A plain device holds pages as they are.** Anyone who can read the
+  card's memory can read them. They are wiped when the device is stopped
+  cleanly; use `--compress` if that is not enough, which also encrypts.
 - **After a driver upgrade, leave devices running until you reboot.** Ubuntu's
   driver packages replace the libraries but leave the old kernel module
   loaded, so a running device carries on unharmed. A device started after
@@ -268,14 +295,29 @@ swap: `swapoff /swap.img && swapon /swap.img`.
   leave them room.
 - **Mounting over a directory in use** (such as a live `/tmp`) hides what is
   already there, including sockets that running programs depend on.
-- **Suspend** only works if the driver saves VRAM (`vroomctl list` warns if
-  `PreserveVideoMemoryAllocations` is off).
+- **Suspend and hibernate are not handled.** They only work if the driver
+  saves VRAM (`vroomctl list` warns if `PreserveVideoMemoryAllocations` is
+  off), and even then the driver writes the whole device to disk on the way
+  down. Nothing moves the pages off the card first: on a machine that
+  sleeps, `vroomctl stop` the device beforehand, or do not use vroom yet.
 - **Swapping to a userspace daemon can deadlock under extreme memory
   pressure.** Mitigations in place: `mlockall`, page-locked staging buffers,
   `PR_SET_IO_FLUSHER`, OOM score −1000. Keep disk swap enabled as the
   lower-priority fallback.
 - Removing a swap device needs somewhere to put its pages. If RAM and other
   swap are full, swapoff fails and the device stays active.
+
+## Testing
+
+`make check` builds the daemon against a card made of ordinary memory and
+runs its self-tests under the address and undefined-behaviour sanitizers.
+It needs no GPU and no root, and is what CI runs. It covers the storage
+engine: integrity through rewrites, cleaning, spilling and coming back,
+several writers at once, discards, a damaged record, an altered page, a
+failing spill disk, and a check after each stage that the store's tables
+agree with each other. `vroomctl selftest` runs the same tests on a real
+card. Neither covers the kernel side (the ublk queue, attaching, signals,
+`vroomctl` itself), which has only been tested by hand.
 
 ## How it works
 
@@ -295,6 +337,22 @@ kernel swap ──► /dev/nbd0   ──► socketpair ──┐
   serialises copies within a context, so one queue is fastest; several queues
   were measurably slower.
 
+## Related projects
+
+- [vramfs](https://github.com/Overv/vramfs): a FUSE filesystem in VRAM
+  through OpenCL, so not tied to NVIDIA. The original, and by its own
+  README not meant for serious use.
+- [nbd-vram](https://github.com/c0deJedi/nbd-vram): VRAM as swap through the
+  CUDA driver API and NBD, the closest relative. It unhooks the swap before
+  suspend and puts it back afterwards, which vroom does not do yet.
+- [nbdkit-vram-plugin](https://libguestfs.org/nbdkit-vram-plugin.1.html):
+  an nbdkit plugin over OpenCL, for any GPU with OpenCL.
+
+If all you want is more swap and the RAM is not already full of things that
+do not compress, zram costs nothing and needs no GPU. vroom is for memory
+that would otherwise sit idle on a card, and the two stack: zram first,
+vroom next, disk last.
+
 ## Roadmap
 
 Ideas, not promises, in the order they are likely to be done:
@@ -312,7 +370,7 @@ Ideas, not promises, in the order they are likely to be done:
    70%, if real use shows the fixed ones to be wrong.
 5. **Encrypt plain devices too.** Only the compressed store is encrypted.
 6. **GPUs other than NVIDIA's**, through Vulkan or OpenCL.
-7. A `--help` for `vroomctl`, a CI build, packages other than `.deb`.
+7. A `--help` for `vroomctl`, packages other than `.deb`.
 
 ## License
 

@@ -5,7 +5,7 @@ Maintainer: Jonathan Baker <jon@vitund.ai>
 Section: admin
 Priority: optional
 Depends: libc6, kmod, util-linux, e2fsprogs, systemd
-Recommends: libcuda1 | libnvidia-compute
+Recommends: libcuda1 | libnvidia-compute, libzstd1, libssl3 | libssl3t64
 Description: use idle NVIDIA VRAM as swap or scratch disks
  vroom allocates video memory on an otherwise unused NVIDIA GPU through the
  driver's CUDA library and exposes it to the kernel as block devices (ublk
