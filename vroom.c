@@ -222,8 +222,8 @@ static int vram_rw(int wr, uint64_t off, char *buf, size_t len)
  * 8-byte header naming the record, to a log laid over the VRAM in 1 MiB
  * segments. Tables in RAM say which record each page points at and where
  * each record is. Pages with identical contents point at the same record: a
- * page arriving is hashed, and if a record with that hash turns out, read
- * back, to hold the same bytes, the page just points at it. A record nothing
+ * page arriving is fingerprinted, and if a record has that fingerprint the
+ * page just points at it, wherever the record now is. A record nothing
  * points at any more is dead; a segment with nothing live in it is free
  * again, and when free segments run short the one with the least live data
  * is read back and its survivors appended afresh.
@@ -283,8 +283,21 @@ static struct {
 } ev;
 static const char *cipher_name = "aes";
 static const void *cipher;
-static unsigned char cipher_key[32];
+static unsigned char cipher_key[32], print_key[32];
 static uint64_t next_nonce;
+
+/*
+ * A page's fingerprint: the cipher's own 128-bit authenticator run over the
+ * page under a second key that never leaves this process. Two pages with the
+ * same fingerprint are taken to be the same page, without reading the stored
+ * one back, which is what lets a page be matched against a copy that has
+ * gone to the spill file. Someone who does not know the key cannot make two
+ * different pages collide, and the chance of it happening by itself is about
+ * 1 in 2^100 for every pair of pages.
+ */
+struct fp {
+	uint64_t a, b;
+};
 
 static struct {
 	void *(*CreateCCtx)(void);
@@ -301,7 +314,7 @@ static struct {
 	uint32_t *map;	 /* per page: the record with its contents, or 0 if it reads as zeros */
 	/* Per record. Pages with identical contents share one, so it can move without touching them. */
 	uint64_t *rloc;	 /* where it is: E_MAKE(offset, length); 0 until it has been written */
-	uint64_t *rhash; /* hash of the page it holds */
+	struct fp *rfp;	 /* fingerprint of the page it holds */
 	uint32_t *rref;	 /* how many pages point at it; for an unused id, the next unused one */
 	uint32_t rfree, rmax;
 	uint32_t *idx;	 /* open-addressed: hash -> a record holding that page */
@@ -328,8 +341,8 @@ static void *rehydrate_thread(void *arg);
 
 /* Per-thread compressor state and page-locked buffer for records on their way in or out. */
 static __thread struct {
-	void *cc, *dc, *seal, *open;
-	char *stage, *page;
+	void *cc, *dc, *seal, *open, *print;
+	char *stage;
 } ct;
 
 static void ct_init(void)
@@ -341,15 +354,27 @@ static void ct_init(void)
 	if (cu.MemAllocHost(&p, sz) && posix_memalign(&p, BLK, sz))
 		die("cannot allocate staging buffer");
 	ct.stage = p;
-	ct.page = malloc(BLK);
 	ct.cc = z.CreateCCtx();
 	ct.dc = z.CreateDCtx();
 	ct.seal = ev.CtxNew();
 	ct.open = ev.CtxNew();
-	if (!ct.cc || !ct.dc || !ct.page || !ct.seal || !ct.open ||
+	ct.print = ev.CtxNew();
+	if (!ct.cc || !ct.dc || !ct.seal || !ct.open || !ct.print ||
 	    ev.Init(ct.seal, cipher, NULL, cipher_key, NULL, 1) != 1 ||
-	    ev.Init(ct.open, cipher, NULL, cipher_key, NULL, 0) != 1)
+	    ev.Init(ct.open, cipher, NULL, cipher_key, NULL, 0) != 1 ||
+	    ev.Init(ct.print, cipher, NULL, print_key, NULL, 1) != 1)
 		die("cannot set up compression and encryption");
+}
+
+static int page_print(const char *page, struct fp *f)
+{
+	static const unsigned char iv[12];
+	unsigned char end[16];
+	int n;
+
+	return ev.Init(ct.print, NULL, NULL, NULL, iv, -1) != 1 ||
+	       ev.Update(ct.print, NULL, &n, (const unsigned char *)page, BLK) != 1 ||
+	       ev.Final(ct.print, end, &n) != 1 || ev.Ctrl(ct.print, 0x10 /* get tag */, 16, f) != 1;
 }
 
 /* Encrypt (seal) or check and decrypt a record's data where it lies. r->id and r->len must be set. */
@@ -398,8 +423,9 @@ static void cs_init(void)
 		cipher = ev.ChaCha();
 	else
 		die("--cipher is aes or chacha20");
-	if (getrandom(cipher_key, sizeof cipher_key, 0) != sizeof cipher_key)
-		die("cannot get random bytes for the key: %s", strerror(errno));
+	if (getrandom(cipher_key, sizeof cipher_key, 0) != sizeof cipher_key ||
+	    getrandom(print_key, sizeof print_key, 0) != sizeof print_key)
+		die("cannot get random bytes for the keys: %s", strerror(errno));
 	/* Nobody outside should be able to make two pages hash alike on purpose. */
 	if (getrandom(&hash_secret, sizeof hash_secret, 0) != sizeof hash_secret)
 		hash_secret = (uint64_t)time(NULL) * 0x9E3779B97F4A7C15ULL ^ (uintptr_t)&lib;
@@ -431,7 +457,7 @@ static void cs_init(void)
 	cs.idx_mask = cap - 1;
 	cs.map = calloc(npages, sizeof *cs.map);
 	cs.rloc = calloc(cs.rmax + 1, sizeof *cs.rloc);
-	cs.rhash = calloc(cs.rmax + 1, sizeof *cs.rhash);
+	cs.rfp = calloc(cs.rmax + 1, sizeof *cs.rfp);
 	cs.rref = calloc(cs.rmax + 1, sizeof *cs.rref);
 	cs.idx = calloc(cap, sizeof *cs.idx);
 	cs.live = calloc(all, sizeof *cs.live);
@@ -450,7 +476,7 @@ static void cs_init(void)
 	if (cu.MemAllocHost(&p, SEG) && posix_memalign(&p, BLK, SEG))
 		p = NULL;
 	cs.rebuf = p;
-	if (!cs.map || !cs.rloc || !cs.rhash || !cs.rref || !cs.idx || !cs.live || !cs.used || !cs.seq ||
+	if (!cs.map || !cs.rloc || !cs.rfp || !cs.rref || !cs.idx || !cs.live || !cs.used || !cs.seq ||
 	    !cs.pins || !cs.state || !cs.freelist || !cs.sfree || !cs.gcbuf || !cs.evbuf || !cs.rebuf)
 		die("out of memory for the compressed store's tables");
 	for (uint32_t id = 1; id <= cs.rmax; id++)
@@ -531,7 +557,7 @@ static void idx_insert(uint32_t id)
 			if (cs.rloc[r] && r != id)
 				idx_insert(r);
 	}
-	uint64_t i = cs.rhash[id] & cs.idx_mask;
+	uint64_t i = cs.rfp[id].a & cs.idx_mask;
 	while (cs.idx[i] && cs.idx[i] != IDX_GONE)
 		i = (i + 1) & cs.idx_mask;
 	cs.idx_used += !cs.idx[i];
@@ -540,30 +566,30 @@ static void idx_insert(uint32_t id)
 
 static void idx_remove(uint32_t id)
 {
-	for (uint64_t i = cs.rhash[id] & cs.idx_mask; cs.idx[i]; i = (i + 1) & cs.idx_mask)
+	for (uint64_t i = cs.rfp[id].a & cs.idx_mask; cs.idx[i]; i = (i + 1) & cs.idx_mask)
 		if (cs.idx[i] == id) {
 			cs.idx[i] = IDX_GONE;
 			return;
 		}
 }
 
-static uint32_t idx_find(uint64_t h)
+static uint32_t idx_find(const struct fp *f)
 {
-	for (uint64_t i = h & cs.idx_mask; cs.idx[i]; i = (i + 1) & cs.idx_mask)
-		if (cs.idx[i] != IDX_GONE && cs.rhash[cs.idx[i]] == h)
+	for (uint64_t i = f->a & cs.idx_mask; cs.idx[i]; i = (i + 1) & cs.idx_mask)
+		if (cs.idx[i] != IDX_GONE && cs.rfp[cs.idx[i]].a == f->a && cs.rfp[cs.idx[i]].b == f->b)
 			return cs.idx[i];
 	return 0;
 }
 
 /* A new record with one page pointing at it, not yet written anywhere. */
-static uint32_t rec_alloc(uint64_t h)
+static uint32_t rec_alloc(const struct fp *h)
 {
 	uint32_t id = cs.rfree;
 	if (!id)
 		return 0;
 	cs.rfree = cs.rref[id];
 	cs.rref[id] = 1;
-	cs.rhash[id] = h;
+	cs.rfp[id] = *h;
 	cs.rloc[id] = 0;
 	cs.recs++;
 	return id;
@@ -846,27 +872,11 @@ static int page_is_zero(const char *p)
 	return !w && !memcmp(p, p + 8, BLK - 8);
 }
 
-/* Does this record, which has the same hash, really hold this page? Only looks in VRAM. */
-static int rec_matches(uint32_t id, const char *page)
-{
-	uint64_t e = cs.rloc[id];
-	struct rec r;
-	char *data = ct.stage + REC_HDR;
-
-	if (E_OFF(e) >= phys_size || vram_rw(0, E_OFF(e), ct.stage, REC_HDR + E_LEN(e)))
-		return 0;
-	memcpy(&r, ct.stage, sizeof r);
-	if (r.len != E_LEN(e) || rec_crypt(0, &r, data))
-		return 0;
-	if (r.len == BLK)
-		return !memcmp(data, page, BLK);
-	return z.Decompress(ct.dc, ct.page, BLK, data, r.len) == BLK && !memcmp(ct.page, page, BLK);
-}
-
 static int cs_write(uint64_t off, const char *buf, size_t len)
 {
 	enum { ZERO, SHARED, NEW };
-	uint64_t lpn = off / BLK, hash[MAX_PAGES];
+	uint64_t lpn = off / BLK;
+	struct fp print[MAX_PAGES];
 	uint32_t id[MAX_PAGES];
 	uint8_t kind[MAX_PAGES];
 	size_t n = len / BLK, out = 0, fresh = 0;
@@ -877,8 +887,11 @@ static int cs_write(uint64_t off, const char *buf, size_t len)
 	ct_init();
 	for (size_t i = 0; i < n; i++) {
 		kind[i] = page_is_zero(buf + i * BLK) ? ZERO : NEW;
-		if (kind[i] == NEW)
-			hash[i] = page_hash(buf + i * BLK), fresh++;
+		if (kind[i] == NEW) {
+			fresh++;
+			if (page_print(buf + i * BLK, &print[i]))
+				return EIO;
+		}
 	}
 	/* A page we already hold a copy of just points at that copy. */
 	if (fresh) {
@@ -887,12 +900,16 @@ static int cs_write(uint64_t off, const char *buf, size_t len)
 			uint32_t r;
 			if (kind[i] != NEW)
 				continue;
-			if ((r = idx_find(hash[i])) && cs.rref[r] != UINT32_MAX && rec_matches(r, buf + i * BLK)) {
+			r = idx_find(&print[i]);
+			for (size_t j = 0; j < i && !r; j++) /* or one arriving in this same request */
+				if (kind[j] == NEW && print[j].a == print[i].a && print[j].b == print[i].b)
+					r = id[j];
+			if (r && cs.rref[r] != UINT32_MAX) {
 				cs.rref[r]++;
 				id[i] = r;
 				kind[i] = SHARED;
 				fresh--;
-			} else if (!(id[i] = rec_alloc(hash[i]))) { /* the rest get a record of their own */
+			} else if (!(id[i] = rec_alloc(&print[i]))) { /* the rest get a record of their own */
 				err = ENOSPC;
 			}
 		}
@@ -1231,7 +1248,8 @@ static void *stat_thread(void *arg)
 				(unsigned long long)pages, (unsigned long long)bytes, (unsigned long long)held,
 				(unsigned long long)refused, (unsigned long long)sbytes,
 				(unsigned long long)spill_size, (unsigned long long)recs);
-		fprintf(f, "VRAM_BYTES=%llu\n", (unsigned long long)phys_size);
+		fprintf(f, "VRAM_BYTES=%llu\nCIPHER=%s\n", (unsigned long long)phys_size,
+			cratio ? cipher_name : "none");
 		for (int k = 0; k < P_KINDS; k++)
 			fprintf(f, "%s_OPS=%llu\n%s_MIB=%llu\n%s_US=%.1f\n%s_MIBS=%.0f\n%s_KIB=%.0f\n", kind[k],
 				(unsigned long long)was[k].ops, kind[k], (unsigned long long)(was[k].bytes / MiB),
@@ -2184,6 +2202,30 @@ static void selftest_compress(int threads)
 	} else {
 		if (err && (err != ENOSPC || spill_size >= dev_size))
 			die("selftest: filling with incompressible data gave error %d", err);
+		for (uint64_t c = 0; c < npages; c++) { /* a page stored as it is, in the file, must not be the page */
+			uint64_t e = cs.rloc[cs.map[c]], fo = E_OFF(e) - phys_size;
+			if (!e || E_LEN(e) != BLK || E_OFF(e) < phys_size)
+				continue;
+			pattern(ta, c, tver[c]);
+			if (pread(spill_fd, tb, 3 * BLK, fo & ~(uint64_t)(BLK - 1)) < BLK + REC_HDR ||
+			    !memcmp(ta, tb + (fo & (BLK - 1)) + REC_HDR, BLK))
+				die("selftest: page %llu is in the spill file unencrypted", (unsigned long long)c);
+			printf("spill file            holds no plain page\n");
+			if (!err) { /* the same page written elsewhere must find its copy in the file */
+				uint64_t d = c ? c - 1 : c + 1;
+				char *keep = malloc(BLK);
+				if (nbd_io(fd, NBD_CMD_READ, d * BLK, keep, BLK) ||
+				    nbd_io(fd, NBD_CMD_WRITE, d * BLK, ta, BLK) || cs.map[d] != cs.map[c] ||
+				    E_OFF(cs.rloc[cs.map[c]]) < phys_size ||
+				    nbd_io(fd, NBD_CMD_READ, d * BLK, tb, BLK) || memcmp(ta, tb, BLK))
+					die("selftest: a page was not matched with its copy in the spill file");
+				if (nbd_io(fd, NBD_CMD_WRITE, d * BLK, keep, BLK))
+					die("selftest: could not put a page back");
+				free(keep);
+				printf("spilled copies        are matched\n");
+			}
+			break;
+		}
 		t = now();
 		check_all(fd, "after spilling");
 		printf("incompressible    %llu MiB in VRAM, %llu MiB spilled%s; all read back at %.0f MiB/s\n",

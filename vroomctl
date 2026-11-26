@@ -239,6 +239,12 @@ list | status)
 			;;
 		raw) use="raw, /dev/vroom/$name" ;;
 		esac
+		if [ "$state" = active ]; then
+			case "$(sed -n 's/^CIPHER=//p' "/run/vroom/$kname.stat" 2>/dev/null)" in
+			none) use="$use; not encrypted" ;;
+			?*) use="$use; encrypted" ;;
+			esac
+		fi
 		if [ "$state" = active ] && grep -qs '^COMPRESSED=1' "/run/vroom/$kname.stat"; then
 			use="$use; $(. "/run/vroom/$kname.stat"; awk -v p="$PAGES" -v b="$STORED_BYTES" \
 				-v v="$VRAM_BYTES" -v s="$SPILLED_BYTES" -v r="$REFUSED" 'BEGIN {
@@ -273,6 +279,11 @@ stats)
 		if is_swap; then
 			awk -v d="$DEV" '$1 == d { printf "  swap     %10.0f MiB used of %.0f\n", $4 / 1024, $3 / 1024 }' /proc/swaps
 		fi
+		case "$(sed -n 's/^CIPHER=//p' "/run/vroom/$kname.stat" 2>/dev/null)" in
+		none) echo "  encryption     none: pages are on the card as they are" ;;
+		aes) echo "  encryption     AES-256-GCM, key held only in the daemon's memory" ;;
+		chacha20) echo "  encryption     ChaCha20-Poly1305, key held only in the daemon's memory" ;;
+		esac
 		if grep -qs '^COMPRESSED=1' "/run/vroom/$kname.stat"; then
 			(. "/run/vroom/$kname.stat"; awk -v p="$PAGES" -v b="$STORED_BYTES" -v v="$VRAM_BYTES" \
 				-v s="$SPILLED_BYTES" -v r="$REFUSED" -v n="${RECORDS:-0}" 'BEGIN { m = 1048576
