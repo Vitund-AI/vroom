@@ -336,6 +336,8 @@ stats)
 				printf "\n  %-12s %d%% full\n", "VRAM", b * 100 / v["VRAM_BYTES"]
 				if (p > 0 && v["RECORDS"] > 0)
 					printf "  %-12s %.1f%% of pages are a copy of another\n", "sharing", (p - v["RECORDS"]) * 100 / p
+				if ("WAITS" in v)
+					printf "  %-12s %s writes have had to wait for room on the card\n", "housekeeping", (v["WAITS"] > 0 ? count(v["WAITS"]) : "no")
 				if (v["REFUSED"] > 0)
 					printf "  %-12s %d WRITES, because the store was full\n", "REFUSED", v["REFUSED"]
 			}

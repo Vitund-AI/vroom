@@ -357,20 +357,24 @@ static struct {
 		char *buf;
 	} held[16];
 	uint64_t held_clock, held_hits;
-	pthread_cond_t wake;
+	pthread_cond_t wake, room; /* work for the keeper; room made for writers */
+	int stuck;		   /* the keeper can free nothing more: the store is full */
+	uint32_t ahead;		   /* free segments the keeper tries to keep in hand */
+	uint64_t waits;		   /* writes that had to wait for it */
 	uint32_t *freelist, nseg, nfree, open;
 	uint32_t *sfree, nspill, nsfree; /* spill segments are numbered nseg onwards */
 	char *gcbuf, *evbuf, *rebuf;
 	uint64_t clock;
 	uint64_t pages, recs, bytes, sbytes; /* pages held, the records behind them, their bytes, and how much of that is spilled */
 	uint64_t cleaned, refused, evicted, returned;
-} cs = { .lock = PTHREAD_MUTEX_INITIALIZER, .wake = PTHREAD_COND_INITIALIZER };
+} cs = { .lock = PTHREAD_MUTEX_INITIALIZER, .wake = PTHREAD_COND_INITIALIZER,
+	 .room = PTHREAD_COND_INITIALIZER };
 
 static const char *spill_path;
 static int spill_fd = -1;
 static uint64_t spill_size;
 static int high_pct = 90, low_pct = 70;
-static void *rehydrate_thread(void *arg);
+static void *keeper_thread(void *arg);
 
 /* Per-thread compressor state and page-locked buffer for records on their way in or out. */
 static __thread struct {
@@ -528,10 +532,9 @@ static void cs_init(void)
 		cs.sfree[cs.nsfree++] = cs.nseg + s;
 	cs.open = 0;
 	cs.state[0] = SEG_OPEN;
-	if (spill_fd >= 0) {
-		pthread_t t;
-		pthread_create(&t, NULL, rehydrate_thread, NULL);
-	}
+	cs.ahead = cs.nseg / 32 < 4 ? 4 : cs.nseg / 32 > 64 ? 64 : cs.nseg / 32;
+	pthread_t t;
+	pthread_create(&t, NULL, keeper_thread, NULL);
 }
 
 static uint64_t page_hash(const char *p)
@@ -554,6 +557,7 @@ static void seg_free(uint32_t s)
 	cs.state[s] = SEG_FREE;
 	cs.used[s] = 0;
 	cs.hits[s] = 0;
+	cs.stuck = 0; /* space has come back: worth trying again */
 	if (s < cs.nseg)
 		cs.freelist[cs.nfree++] = s;
 	else
@@ -583,6 +587,7 @@ static void loc_account(uint64_t e, int add)
 	cs.live[s] -= sz;
 	if (s >= cs.nseg)
 		cs.sbytes -= sz;
+	cs.stuck = 0; /* something has died: there may be room to be made again */
 	if (!cs.live[s] && cs.state[s] == SEG_CLOSED)
 		seg_free(s);
 }
@@ -720,6 +725,9 @@ static int log_append(const char *buf, size_t bytes)
  * the segment, to dst at offset out, as long as they fit below limit. Returns
  * the new offset; *all says whether every one of them fitted. dst may be src.
  */
+static uint64_t moved_from[SEG / (REC_HDR + 1) + 1]; /* by evict: where each record it is moving was */
+static size_t nmoved;
+
 static size_t survivors(const char *src, uint32_t v, char *dst, size_t out, size_t limit, int *all)
 {
 	struct rec r;
@@ -737,6 +745,8 @@ static size_t survivors(const char *src, uint32_t v, char *dst, size_t out, size
 		}
 		memmove(dst + out, src + pos, REC_HDR + r.len);
 		out += REC_HDR + r.len;
+		if (dst == cs.evbuf)
+			moved_from[nmoved++] = (uint64_t)v * SEG + pos;
 	}
 	return out;
 }
@@ -771,11 +781,12 @@ static int evict(void)
 	uint32_t slot, v, best = UINT32_MAX;
 	uint64_t floor = 0;
 	size_t out = 0;
-	int reuse = !cs.nsfree, all;
+	int reuse = !cs.nsfree, all, err = 0;
 	struct rec r;
 
 	if (spill_fd < 0)
 		return ENOSPC;
+	nmoved = 0;
 	if (reuse) {
 		slot = 0;
 		for (uint32_t s = cs.nseg; s < cs.nseg + cs.nspill; s++)
@@ -816,58 +827,46 @@ static int evict(void)
 	if (out == own)
 		return ENOSPC; /* nothing in VRAM that can move */
 	memset(cs.evbuf + out, 0, -out & (BLK - 1));
-	if (spill_io(1, cs.evbuf, (out + BLK - 1) & ~(size_t)(BLK - 1), (uint64_t)(slot - cs.nseg) * SEG))
-		return EIO;
-	if (!reuse)
+	if (reuse) {
+		/* its records are being read from the file as we speak: all of this under the lock */
+		err = spill_io(1, cs.evbuf, (out + BLK - 1) & ~(size_t)(BLK - 1), (uint64_t)(slot - cs.nseg) * SEG);
+	} else {
+		/*
+		 * A free segment holds nothing anyone can ask for, so the write to
+		 * disk, the slow part, is done with the lock dropped. Meanwhile the
+		 * records are still on the card and may be read, discarded or
+		 * shared; whichever have gone by the time the lock is back are
+		 * simply not moved.
+		 */
 		cs.nsfree--;
+		cs.state[slot] = SEG_CLEANING;
+		pthread_mutex_unlock(&cs.lock);
+		err = spill_io(1, cs.evbuf, (out + BLK - 1) & ~(size_t)(BLK - 1), (uint64_t)(slot - cs.nseg) * SEG);
+		pthread_mutex_lock(&cs.lock);
+	}
+	if (err) {
+		if (!reuse)
+			seg_free(slot);
+		return EIO;
+	}
 	cs.state[slot] = SEG_CLEANING; /* its own records leaving must not free it */
-	for (size_t pos = 0; pos < out; pos += REC_HDR + r.len) {
+	size_t k = 0, went = 0;
+	for (size_t pos = 0; pos < out; pos += REC_HDR + r.len, k++) {
 		memcpy(&r, cs.evbuf + pos, sizeof r);
+		if (!cs.rloc[r.id] || E_OFF(cs.rloc[r.id]) != moved_from[k])
+			continue; /* gone, or gone elsewhere, while we were writing */
 		rec_place(r.id, E_MAKE((uint64_t)slot * SEG + pos, r.len));
+		went += REC_HDR + r.len;
 	}
 	cs.used[slot] = out;
 	cs.hits[slot] = 0;
 	held_drop(slot);
 	cs.seq[slot] = ++cs.clock;
 	cs.state[slot] = SEG_CLOSED;
-	cs.evicted += out - own;
+	if (!cs.live[slot])
+		seg_free(slot);
+	cs.evicted += went;
 	return 0;
-}
-
-/* While the card is below its low-water mark, bring the most recently spilled segment back. */
-static void *rehydrate_thread(void *arg)
-{
-	(void)arg;
-	cu.CtxSetCurrent(ctx);
-	prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0);
-	pthread_mutex_lock(&cs.lock);
-	for (;;) {
-		uint32_t v = 0;
-		uint64_t newest = 0;
-
-		if (cs.sbytes && (cs.bytes - cs.sbytes) * 100 < phys_size * low_pct && cs.nfree >= 4)
-			for (uint32_t s = cs.nseg; s < cs.nseg + cs.nspill; s++)
-				if (cs.state[s] == SEG_CLOSED && cs.seq[s] > newest)
-					newest = cs.seq[s], v = s;
-		if (!newest) {
-			pthread_mutex_unlock(&cs.lock);
-			usleep(50000);
-			pthread_mutex_lock(&cs.lock);
-			continue;
-		}
-		size_t span = (cs.used[v] + BLK - 1) & ~(size_t)(BLK - 1);
-		cs.pins[v]++; /* nothing may rewrite it while we read it with the lock dropped */
-		pthread_mutex_unlock(&cs.lock);
-		int ok = !spill_io(0, cs.rebuf, span, (uint64_t)(v - cs.nseg) * SEG);
-		pthread_mutex_lock(&cs.lock);
-		cs.pins[v]--;
-		if (ok && cs.state[v] == SEG_CLOSED && cs.seq[v] == newest && cs.nfree >= 4) {
-			size_t out = survivors(cs.rebuf, v, cs.rebuf, 0, SEG, NULL);
-			if (!log_append(cs.rebuf, out))
-				cs.returned += out;
-		}
-	}
-	return NULL;
 }
 
 /* Empty the closed segment holding the least live data. Fails if none would give much back. */
@@ -895,29 +894,96 @@ static int clean_one(void)
 	return 0;
 }
 
+/* Bring the most recently spilled segment back onto the card. */
+static void rehydrate(void)
+{
+	uint32_t v = 0;
+	uint64_t newest = 0;
+
+	for (uint32_t s = cs.nseg; s < cs.nseg + cs.nspill; s++)
+		if (cs.state[s] == SEG_CLOSED && cs.seq[s] > newest)
+			newest = cs.seq[s], v = s;
+	if (!newest)
+		return;
+	size_t span = (cs.used[v] + BLK - 1) & ~(size_t)(BLK - 1);
+	cs.pins[v]++; /* nothing may rewrite it while we read it with the lock dropped */
+	pthread_mutex_unlock(&cs.lock);
+	int ok = !spill_io(0, cs.rebuf, span, (uint64_t)(v - cs.nseg) * SEG);
+	pthread_mutex_lock(&cs.lock);
+	cs.pins[v]--;
+	if (ok && cs.state[v] == SEG_CLOSED && cs.seq[v] == newest && cs.nfree >= 4) {
+		size_t out = survivors(cs.rebuf, v, cs.rebuf, 0, SEG, NULL);
+		if (!log_append(cs.rebuf, out))
+			cs.returned += out;
+	}
+}
+
 /*
- * Make room for `need` bytes of records, keeping two segments back for
- * cleaning to work in. Above the high-water mark every write also pays for
- * one eviction, so the card drains at the rate it is being filled.
+ * The keeper: the one thread that does the housekeeping, so that a write
+ * never has to. A write goes to the card and nowhere else; the keeper's job
+ * is to see that there is always room there for it. It keeps a few free
+ * segments in hand by cleaning out those with dead records in them; with a
+ * spill file it also holds the card below its high-water mark by moving the
+ * oldest records out, and below the low-water mark brings them back. A write
+ * waits for it only when the free segments have all gone, which means writes
+ * are arriving faster than the disk can take what they displace.
+ */
+static void *keeper_thread(void *arg)
+{
+	(void)arg;
+	cu.CtxSetCurrent(ctx);
+	prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0);
+	pthread_mutex_lock(&cs.lock);
+	for (;;) {
+		uint64_t on_card = cs.bytes - cs.sbytes;
+		int spill = spill_fd >= 0, err = EAGAIN;
+
+		if (spill && on_card * 100 > phys_size * high_pct) {
+			if ((err = evict()) == ENOSPC && cs.nfree < cs.ahead)
+				err = clean_one(); /* the file is full: at least tidy up */
+		} else if (cs.nfree < cs.ahead) {
+			if ((err = clean_one()) == ENOSPC)
+				err = evict();
+		} else if (spill && cs.sbytes && on_card * 100 < phys_size * low_pct && cs.nfree >= 4) {
+			rehydrate();
+			err = 0;
+		}
+		if (err == ENOSPC && cs.nfree < 3)
+			cs.stuck = 1;
+		pthread_cond_broadcast(&cs.room);
+		if (err) { /* nothing to do, or nothing that can be done: wait to be asked */
+			struct timespec until;
+			clock_gettime(CLOCK_REALTIME, &until);
+			until.tv_nsec += 50000000;
+			until.tv_sec += until.tv_nsec / 1000000000, until.tv_nsec %= 1000000000;
+			pthread_cond_timedwait(&cs.wake, &cs.lock, &until);
+		}
+	}
+	return NULL;
+}
+
+/*
+ * See that there is room on the card for `need` bytes of records, leaving two
+ * segments for the keeper to work in. There nearly always is; if not, wait
+ * for the keeper, and give up only when it says nothing more can be freed.
  */
 static int make_room(size_t need)
 {
-	int over = spill_fd >= 0 && (cs.bytes - cs.sbytes) * 100 > phys_size * high_pct;
+	int waited = 0;
 
 	for (;;) {
 		uint64_t avail = (uint64_t)cs.nfree * SEG + SEG - cs.used[cs.open];
-		if (avail >= need + 2 * SEG) {
-			if (over)
-				evict(); /* if the file is full there is still room here */
+		if (cs.nfree < cs.ahead ||
+		    (spill_fd >= 0 && (cs.bytes - cs.sbytes) * 100 > phys_size * high_pct))
+			pthread_cond_signal(&cs.wake);
+		if (avail >= need + 2 * SEG)
 			return 0;
+		if (cs.stuck) {
+			cs.refused++;
+			return ENOSPC;
 		}
-		int err = over ? evict() : clean_one();
-		if (err == ENOSPC)
-			err = over ? clean_one() : evict();
-		if (err) {
-			cs.refused += err == ENOSPC;
-			return err;
-		}
+		cs.waits += !waited++;
+		pthread_cond_wait(&cs.room, &cs.lock);
 	}
 }
 
@@ -1347,7 +1413,7 @@ static void *stat_thread(void *arg)
 	for (unsigned tick = 0;; tick++, sleep(TICK)) {
 		pthread_mutex_lock(&cs.lock);
 		uint64_t pages = cs.pages, bytes = cs.bytes - cs.sbytes, refused = cs.refused, sbytes = cs.sbytes;
-		uint64_t recs = cs.recs;
+		uint64_t recs = cs.recs, waits = cs.waits;
 		uint64_t held = (uint64_t)(cs.nseg - cs.nfree) * SEG;
 		pthread_mutex_unlock(&cs.lock);
 		int pct = bytes * 100 / phys_size;
@@ -1373,10 +1439,11 @@ static void *stat_thread(void *arg)
 			continue;
 		if (cratio)
 			fprintf(f, "COMPRESSED=1\nPAGES=%llu\nSTORED_BYTES=%llu\nSEGMENT_BYTES=%llu\nREFUSED=%llu\n"
-				   "SPILLED_BYTES=%llu\nSPILL_BYTES=%llu\nRECORDS=%llu\n",
+				   "SPILLED_BYTES=%llu\nSPILL_BYTES=%llu\nRECORDS=%llu\nWAITS=%llu\n",
 				(unsigned long long)pages, (unsigned long long)bytes, (unsigned long long)held,
 				(unsigned long long)refused, (unsigned long long)sbytes,
-				(unsigned long long)spill_size, (unsigned long long)recs);
+				(unsigned long long)spill_size, (unsigned long long)recs,
+				(unsigned long long)waits);
 		fprintf(f, "VRAM_BYTES=%llu\nCIPHER=%s\nUPTIME=%llu\nSAMPLE=%d\n", (unsigned long long)phys_size,
 			cratio ? cipher_name : "none", (unsigned long long)((now_ns() - started) / 1000000000),
 			SAMPLE);
