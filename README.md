@@ -19,6 +19,27 @@ Measured on an RTX 3070 (4K random reads against the live block device):
 Sequential throughput is 3.5–4 GiB/s. That is good-NVMe class, not RAM class:
 about 4 µs of every page is the NVIDIA driver performing the copy.
 
+`vroomctl selftest --size 2048` on two cards, which anyone can repeat without
+root. It exercises the daemon's NBD path without a kernel block device, so
+its figures sit a little below the live ublk device above.
+
+| | RTX 3070 | RTX 4090 |
+|---|---|---|
+| VRAM | 8 GiB | 24 GiB |
+| Host CPU | Ryzen 9 9900X | Ryzen 9 9900X |
+| Host RAM | 32 GiB | 32 GiB |
+| GPU link | PCIe 4.0 x16 | PCIe 4.0 x16 |
+| Sequential write | 3,951 MiB/s | 4,149 MiB/s |
+| Sequential read | 3,685 MiB/s | 3,550 MiB/s |
+| 4K random write, 1 thread | 115k IOPS (8.7 µs) | 105k IOPS (9.5 µs) |
+| 4K random read, 1 thread | 115k IOPS (8.7 µs) | 111k IOPS (9.0 µs) |
+| 4K random read, 4 threads | 193k IOPS | 171k IOPS |
+
+Both hosts ran Ubuntu 26.04, kernel 7.0 and NVIDIA driver 595. The 4090
+figures are the median of three runs, the 3070's a single run. The faster
+card is no faster: the time goes to the driver and the PCIe copy, not the
+GPU, so what a bigger card buys is capacity.
+
 ## Requirements
 
 - Linux with systemd and the `nbd` module, or `ublk_drv` (kernel 6.0+) for the ublk backend
