@@ -144,6 +144,46 @@ swap         active    /dev/ublkb0    5000 MiB  swap, priority 100, 0 MiB used
 - `--boot` recreates the device at every boot. **Contents never survive a stop
   or reboot**: swap and filesystems are made fresh each time.
 
+## Compression and spilling to disk (experimental)
+
+```bash
+sudo vroomctl add swap --compress                        # device is 1.5x the VRAM
+sudo vroomctl add swap --spill /var/lib --ratio 2.2      # 2.2x, overflowing to a file
+```
+
+`--compress` runs every page through zstd on its way to the card (using
+`libzstd.so.1`, which systemd already depends on) and offers a device larger
+than the VRAM behind it. A sample of real swap from a desktop compressed
+2.2x. `vroomctl list` shows the ratio being achieved and how full the card is.
+
+The catch is that the size is a promise made in advance. If the data does not
+compress that well the card fills up and further writes are refused. For swap
+that loses nothing (the page stays in RAM), but the kernel will keep trying,
+so stay conservative: `--ratio` defaults to 1.5. It is not offered for
+`--mount`, where a refused write would corrupt the filesystem.
+
+`--spill PATH` removes the catch by adding a file on disk as a second tier.
+When the card passes 90% full, the oldest pages move to the file; when it
+falls below 70% they come back. With the file as large as the device, which
+is the default, writes are never refused. Pages in the file are read at the
+disk's speed, so this is for the cold tail, not a replacement for the card.
+
+`vroomctl selftest --compress 2.2 --spill FILE` on an RTX 4090 with an NVMe
+SSD, test data that compresses 1.9x:
+
+| | Plain | Compressed | Compressed, part on disk |
+|---|---|---|---|
+| Sequential write | 4,100 MiB/s | 590 MiB/s | 580 MiB/s |
+| Sequential read | 3,550 MiB/s | 1,320 MiB/s | 1,230 MiB/s |
+| 4K random write | 9.5 µs | 16 µs | 16 µs |
+| 4K random read | 9.0 µs | 11.5 µs | 30 µs (a quarter of reads from disk) |
+
+Limits to know about: it costs 8 bytes of RAM per page offered (2 MiB per
+GiB); the two water marks are fixed, not learned; and "oldest" is by when a
+page was last written or last moved. So far this is proven by the self-test
+only, which drives the same code as the kernel would but without a block
+device: treat it as experimental until you have run it as swap yourself.
+
 `vroomctl stop NAME` and `start NAME` release and reclaim the VRAM without
 forgetting the definition, e.g. to lend the GPU to something else. `remove`
 and `stop` refuse, and change nothing, if the device is busy. Each device is

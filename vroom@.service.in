@@ -4,10 +4,10 @@ After=nvidia-persistenced.service
 
 [Service]
 Type=exec
-Environment=VROOM_SIZE_MIB=0 VROOM_GPU=0 VROOM_THREADS=0
+Environment=VROOM_SIZE_MIB=0 VROOM_GPU=0 VROOM_THREADS=0 VROOM_COMPRESS=0 VROOM_SPILL= VROOM_SPILL_MIB=0
 EnvironmentFile=/etc/vroom/%i.conf
 ExecStartPre=@SBINDIR@/vroomctl _prepare %i
-ExecStart=@SBINDIR@/vroom --dev ${VROOM_DEV} --size ${VROOM_SIZE_MIB} --gpu ${VROOM_GPU} --threads ${VROOM_THREADS}
+ExecStart=@SBINDIR@/vroom --dev ${VROOM_DEV} --size ${VROOM_SIZE_MIB} --gpu ${VROOM_GPU} --threads ${VROOM_THREADS} --compress ${VROOM_COMPRESS} --spill ${VROOM_SPILL} --spill-size ${VROOM_SPILL_MIB}
 ExecStartPost=@SBINDIR@/vroomctl _attach %i
 ExecStop=@SBINDIR@/vroomctl _detach %i
 

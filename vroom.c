@@ -8,7 +8,10 @@
  * transmission protocol. Every block I/O is one host<->device copy across PCIe.
  *
  *   vroom --selftest [--size MiB]          integrity + speed test, no root
- *   vroom --nbd /dev/nbd0 [--size MiB]     serve the device (root)
+ *   vroom --dev /dev/ublkb0 [--size MiB]   serve the device (root)
+ *
+ * With --compress RATIO pages are compressed on their way in and the device is
+ * that much larger than the VRAM; --spill FILE lets it overflow to a file.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -19,6 +22,7 @@
 #include <linux/io_uring.h>
 #include <linux/nbd.h>
 #include <linux/ublk_cmd.h>
+#include <limits.h>
 #include <stddef.h>
 #include <sys/syscall.h>
 #include <pthread.h>
@@ -32,6 +36,7 @@
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -66,6 +71,9 @@ static struct {
 } cu;
 
 static CUcontext ctx;
+static void cs_init(void);
+static double cratio;   /* --compress: how much larger than the VRAM the device is; 0: off */
+static uint64_t phys_size; /* VRAM behind the device; the same as dev_size unless compressing */
 static CUdeviceptr *chunks;
 static uint64_t dev_size;
 
@@ -123,20 +131,29 @@ static void vram_init(int gpu, uint64_t size_mib)
 			die("only %llu MiB of VRAM free", free_b / MiB);
 		size_mib = free_b / MiB - 256;
 	}
-	dev_size = size_mib * MiB;
+	phys_size = dev_size = size_mib * MiB;
 	fprintf(stderr, "vroom: %s: %llu MiB free of %llu MiB, taking %llu MiB\n", name,
 		free_b / MiB, total_b / MiB, (unsigned long long)size_mib);
+	if (cratio) {
+		if (size_mib < 16)
+			die("--compress needs at least 16 MiB");
+		dev_size = (uint64_t)(size_mib * cratio) * MiB;
+		fprintf(stderr, "vroom: compressing: offering %llu MiB (%.2fx)\n",
+			(unsigned long long)(dev_size / MiB), cratio);
+	}
 
-	uint64_t n = (dev_size + CHUNK - 1) / CHUNK;
+	uint64_t n = (phys_size + CHUNK - 1) / CHUNK;
 	chunks = calloc(n, sizeof *chunks);
 	for (uint64_t i = 0; i < n; i++) {
-		uint64_t len = dev_size - i * CHUNK < CHUNK ? dev_size - i * CHUNK : CHUNK;
+		uint64_t len = phys_size - i * CHUNK < CHUNK ? phys_size - i * CHUNK : CHUNK;
 		if ((r = cu.MemAlloc(&chunks[i], len)))
 			die("VRAM allocation failed at %llu MiB (CUDA error %d)",
 			    (unsigned long long)(i * CHUNK / MiB), r);
 		if ((r = cu.MemsetD8(chunks[i], 0, len)))
 			die("VRAM clear failed (CUDA error %d)", r);
 	}
+	if (cratio)
+		cs_init();
 }
 
 static int vram_rw(int wr, uint64_t off, char *buf, size_t len)
@@ -153,6 +170,585 @@ static int vram_rw(int wr, uint64_t off, char *buf, size_t len)
 		off += n, buf += n, len -= n;
 	}
 	return 0;
+}
+
+/*
+ * ---- compressed store (--compress RATIO) ----
+ *
+ * Each 4K page is compressed by itself and appended, behind an 8-byte header
+ * naming it, to a log laid over the VRAM in 1 MiB segments. A table in RAM
+ * says where the current copy of every page is. Overwriting or discarding a
+ * page only marks the old copy dead; a segment with nothing live in it is
+ * free again, and when free segments run short the one with the least live
+ * data is read back and its survivors appended afresh.
+ *
+ * Writing a request is one copy to the card however many pages it holds, and
+ * pages written together are read back together, as swap tends to do.
+ *
+ * The device is advertised RATIO times larger than the VRAM behind it. If the
+ * data does not compress that well the store fills up and writes fail with
+ * ENOSPC. For swap that is survivable (the page stays in RAM); a filesystem
+ * would be corrupted, so vroomctl only offers this for swap.
+ *
+ * With --spill FILE there is a second, slower tier, so that a full card
+ * overflows instead of refusing. The file is cut into the same 1 MiB pieces.
+ * Above the high-water mark each write also moves about 1 MiB of the oldest
+ * segments' live records to the file; below the low-water mark a thread
+ * brings the most recently moved ones back. Pages in the file are read
+ * straight from it.
+ */
+#define SEG (1 * MiB)
+#define REC_HDR 8
+#define RAW_ABOVE 3584 /* a page that does not get below this is stored as it is */
+#define STAGE_BYTES (BUFSZ + BUFSZ / BLK * REC_HDR + BLK)
+/* Reads from the spill file are block-aligned, so each run of records can carry two blocks of slack. */
+#define STAGE_SPILL ((size_t)MAX_PAGES * 3 * BLK + BLK)
+#define MAX_PAGES (BUFSZ / BLK)
+#define E_VALID (1ULL << 63)
+#define E_OFF(e) ((e) & ((1ULL << 40) - 1))
+#define E_LEN(e) ((uint32_t)((e) >> 40) & 0x1fff)
+enum { SEG_FREE, SEG_OPEN, SEG_CLOSED, SEG_CLEANING };
+
+struct rec {
+	uint32_t lpn;
+	uint16_t len, pad;
+};
+
+static struct {
+	void *(*CreateCCtx)(void);
+	void *(*CreateDCtx)(void);
+	size_t (*Compress)(void *, void *, size_t, const void *, size_t, int);
+	size_t (*Decompress)(void *, void *, size_t, const void *, size_t);
+	unsigned (*IsError)(size_t);
+} z;
+
+static int clevel = 1;
+static struct {
+	pthread_mutex_t lock;
+	uint64_t *map;	    /* per page: 0 reads as zeros, else E_VALID | length << 40 | offset of its record */
+	uint32_t *live;	    /* per segment: bytes of records still current */
+	uint32_t *used;	    /* per segment: bytes appended so far */
+	uint8_t *state;
+	uint64_t *seq;	    /* per segment: when it was opened, for finding the oldest */
+	uint32_t *freelist, nseg, nfree, open;
+	uint32_t *sfree, nspill, nsfree; /* spill segments are numbered nseg onwards */
+	char *gcbuf, *evbuf, *rebuf;
+	uint64_t clock;
+	uint64_t pages, bytes, sbytes; /* pages held, the bytes their records take, and how much of that is spilled */
+	uint64_t cleaned, refused, evicted, returned;
+} cs = { .lock = PTHREAD_MUTEX_INITIALIZER };
+
+static const char *spill_path;
+static int spill_fd = -1;
+static uint64_t spill_size;
+static int high_pct = 90, low_pct = 70;
+static void *rehydrate_thread(void *arg);
+
+/* Per-thread compressor state and page-locked buffer for records on their way in or out. */
+static __thread struct {
+	void *cc, *dc;
+	char *stage;
+} ct;
+
+static void ct_init(void)
+{
+	void *p;
+	if (ct.stage)
+		return;
+	size_t sz = spill_fd >= 0 ? STAGE_SPILL : STAGE_BYTES;
+	if (cu.MemAllocHost(&p, sz) && posix_memalign(&p, BLK, sz))
+		die("cannot allocate staging buffer");
+	ct.stage = p;
+	ct.cc = z.CreateCCtx();
+	ct.dc = z.CreateDCtx();
+	if (!ct.cc || !ct.dc)
+		die("cannot create zstd contexts");
+}
+
+static void cs_init(void)
+{
+	void *lib = dlopen("libzstd.so.1", RTLD_NOW), *p;
+	if (!lib)
+		die("--compress needs libzstd.so.1: %s", dlerror());
+	z.CreateCCtx = sym(lib, "ZSTD_createCCtx");
+	z.CreateDCtx = sym(lib, "ZSTD_createDCtx");
+	z.Compress = sym(lib, "ZSTD_compressCCtx");
+	z.Decompress = sym(lib, "ZSTD_decompressDCtx");
+	z.IsError = sym(lib, "ZSTD_isError");
+
+	cs.nseg = phys_size / SEG;
+	if (spill_path) {
+		/* O_DIRECT: nothing of ours should sit in the page cache while memory is short. */
+		spill_fd = open(spill_path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC | O_DIRECT, 0600);
+		if (spill_fd < 0 && errno == EINVAL)
+			spill_fd = open(spill_path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+		if (spill_fd < 0)
+			die("--spill %s: %s", spill_path, strerror(errno));
+		if (!spill_size)
+			spill_size = dev_size;
+		int r = posix_fallocate(spill_fd, 0, spill_size);
+		if (r)
+			die("--spill %s: cannot reserve %llu MiB: %s", spill_path,
+			    (unsigned long long)(spill_size / MiB), strerror(r));
+		cs.nspill = spill_size / SEG;
+		fprintf(stderr, "vroom: spilling to %s (%llu MiB) above %d%% full, back below %d%%\n",
+			spill_path, (unsigned long long)(spill_size / MiB), high_pct, low_pct);
+	}
+	uint32_t all = cs.nseg + cs.nspill;
+	cs.map = calloc(dev_size / BLK, sizeof *cs.map);
+	cs.live = calloc(all, sizeof *cs.live);
+	cs.used = calloc(all, sizeof *cs.used);
+	cs.seq = calloc(all, sizeof *cs.seq);
+	cs.state = calloc(all, 1);
+	cs.freelist = calloc(cs.nseg, sizeof *cs.freelist);
+	cs.sfree = calloc(cs.nspill + 1, sizeof *cs.sfree);
+	if (cu.MemAllocHost(&p, SEG) && posix_memalign(&p, BLK, SEG))
+		p = NULL;
+	cs.gcbuf = p;
+	if (posix_memalign(&p, BLK, SEG))
+		p = NULL;
+	cs.evbuf = p;
+	if (cu.MemAllocHost(&p, SEG) && posix_memalign(&p, BLK, SEG))
+		p = NULL;
+	cs.rebuf = p;
+	if (!cs.map || !cs.live || !cs.used || !cs.seq || !cs.state || !cs.freelist || !cs.sfree ||
+	    !cs.gcbuf || !cs.evbuf || !cs.rebuf)
+		die("out of memory for the compressed store's tables");
+	for (uint32_t s = cs.nseg; s-- > 1;)
+		cs.freelist[cs.nfree++] = s;
+	for (uint32_t s = cs.nspill; s-- > 0;)
+		cs.sfree[cs.nsfree++] = cs.nseg + s;
+	cs.open = 0;
+	cs.state[0] = SEG_OPEN;
+	if (spill_fd >= 0) {
+		pthread_t t;
+		pthread_create(&t, NULL, rehydrate_thread, NULL);
+	}
+}
+
+static void seg_free(uint32_t s)
+{
+	cs.state[s] = SEG_FREE;
+	cs.used[s] = 0;
+	if (s < cs.nseg)
+		cs.freelist[cs.nfree++] = s;
+	else
+		cs.sfree[cs.nsfree++] = s;
+}
+
+/* Forget the stored copy of a page, if there is one. */
+static void map_drop(uint64_t lpn)
+{
+	uint64_t e = cs.map[lpn];
+	if (!e)
+		return;
+	uint32_t s = E_OFF(e) / SEG, sz = REC_HDR + E_LEN(e);
+	cs.map[lpn] = 0;
+	cs.pages--;
+	cs.bytes -= sz;
+	if (s >= cs.nseg)
+		cs.sbytes -= sz;
+	cs.live[s] -= sz;
+	if (!cs.live[s] && cs.state[s] == SEG_CLOSED)
+		seg_free(s);
+}
+
+/* Append records (header, data, header, data...) to the log and point their pages at them. */
+static int log_append(const char *buf, size_t bytes)
+{
+	while (bytes) {
+		uint32_t s = cs.open;
+		size_t room = SEG - cs.used[s], n = 0;
+		struct rec r;
+
+		while (n < bytes) {
+			memcpy(&r, buf + n, sizeof r);
+			if (n + REC_HDR + r.len > room)
+				break;
+			n += REC_HDR + r.len;
+		}
+		if (!n) { /* this segment is full: move to a free one */
+			if (!cs.nfree)
+				return ENOSPC;
+			cs.state[s] = SEG_CLOSED;
+			if (!cs.live[s])
+				seg_free(s);
+			cs.open = s = cs.freelist[--cs.nfree];
+			cs.state[s] = SEG_OPEN;
+			cs.seq[s] = ++cs.clock;
+			continue;
+		}
+		uint64_t at = (uint64_t)s * SEG + cs.used[s];
+		if (vram_rw(1, at, (char *)buf, n))
+			return EIO;
+		for (size_t pos = 0; pos < n; pos += REC_HDR + r.len) {
+			memcpy(&r, buf + pos, sizeof r);
+			map_drop(r.lpn);
+			cs.map[r.lpn] = E_VALID | (uint64_t)r.len << 40 | (at + pos);
+			cs.pages++;
+			cs.bytes += REC_HDR + r.len;
+			cs.live[s] += REC_HDR + r.len;
+		}
+		cs.used[s] += n;
+		buf += n, bytes -= n;
+	}
+	return 0;
+}
+
+/*
+ * Copy the records of segment v that are still current from src, which holds
+ * the segment, to dst at offset out, as long as they fit below limit. Returns
+ * the new offset; *all says whether every one of them fitted. dst may be src.
+ */
+static size_t survivors(const char *src, uint32_t v, char *dst, size_t out, size_t limit, int *all)
+{
+	struct rec r;
+
+	if (all)
+		*all = 1;
+	for (size_t pos = 0; pos < cs.used[v]; pos += REC_HDR + r.len) {
+		memcpy(&r, src + pos, sizeof r);
+		if (!cs.map[r.lpn] || E_OFF(cs.map[r.lpn]) != (uint64_t)v * SEG + pos)
+			continue;
+		if (out + REC_HDR + r.len > limit) {
+			if (all)
+				*all = 0;
+			break;
+		}
+		memmove(dst + out, src + pos, REC_HDR + r.len);
+		out += REC_HDR + r.len;
+	}
+	return out;
+}
+
+static int spill_io(int wr, char *buf, size_t len, uint64_t off)
+{
+	while (len) {
+		ssize_t n = wr ? pwrite(spill_fd, buf, len, off) : pread(spill_fd, buf, len, off);
+		if (n <= 0) {
+			if (n < 0 && errno == EINTR)
+				continue;
+			fprintf(stderr, "vroom: spill file %s failed: %s\n", wr ? "write" : "read",
+				n ? strerror(errno) : "short");
+			return -1;
+		}
+		buf += n, len -= n, off += n;
+	}
+	return 0;
+}
+
+/*
+ * Move up to one segment's worth of the oldest live records from VRAM to the
+ * spill file. If the file has no free segment, its emptiest one is rewritten
+ * with its own survivors first. Fails with ENOSPC when the file is full too.
+ */
+static int evict(void)
+{
+	uint32_t slot, v, best = UINT32_MAX;
+	uint64_t floor = 0;
+	size_t out = 0;
+	int reuse = !cs.nsfree, all;
+	struct rec r;
+
+	if (spill_fd < 0)
+		return ENOSPC;
+	if (reuse) {
+		slot = 0;
+		for (uint32_t s = cs.nseg; s < cs.nseg + cs.nspill; s++)
+			if (cs.state[s] == SEG_CLOSED && cs.live[s] < best)
+				best = cs.live[s], slot = s;
+		if (best > SEG - SEG / 16)
+			return ENOSPC;
+		if (spill_io(0, cs.gcbuf, (cs.used[slot] + BLK - 1) & ~(size_t)(BLK - 1),
+			     (uint64_t)(slot - cs.nseg) * SEG))
+			return EIO;
+		out = survivors(cs.gcbuf, slot, cs.evbuf, 0, SEG, NULL);
+	} else {
+		slot = cs.sfree[cs.nsfree - 1];
+	}
+	size_t own = out;
+	for (;;) {
+		uint64_t oldest = UINT64_MAX;
+		v = 0;
+		for (uint32_t s = 0; s < cs.nseg; s++)
+			if (cs.state[s] == SEG_CLOSED && cs.seq[s] > floor && cs.seq[s] < oldest)
+				oldest = cs.seq[s], v = s;
+		if (oldest == UINT64_MAX)
+			break;
+		if (vram_rw(0, (uint64_t)v * SEG, cs.gcbuf, cs.used[v]))
+			return EIO;
+		out = survivors(cs.gcbuf, v, cs.evbuf, out, SEG, &all);
+		if (!all)
+			break;
+		floor = oldest;
+	}
+	if (out == own)
+		return ENOSPC; /* nothing in VRAM that can move */
+	memset(cs.evbuf + out, 0, -out & (BLK - 1));
+	if (spill_io(1, cs.evbuf, (out + BLK - 1) & ~(size_t)(BLK - 1), (uint64_t)(slot - cs.nseg) * SEG))
+		return EIO;
+	if (!reuse)
+		cs.nsfree--;
+	cs.state[slot] = SEG_CLEANING; /* dropping its old records must not free it */
+	for (size_t pos = 0; pos < out; pos += REC_HDR + r.len) {
+		memcpy(&r, cs.evbuf + pos, sizeof r);
+		map_drop(r.lpn);
+		cs.map[r.lpn] = E_VALID | (uint64_t)r.len << 40 | ((uint64_t)slot * SEG + pos);
+		cs.pages++;
+		cs.bytes += REC_HDR + r.len;
+		cs.sbytes += REC_HDR + r.len;
+		cs.live[slot] += REC_HDR + r.len;
+	}
+	cs.used[slot] = out;
+	cs.seq[slot] = ++cs.clock;
+	cs.state[slot] = SEG_CLOSED;
+	cs.evicted += out - own;
+	return 0;
+}
+
+/* Below the low-water mark, bring the most recently spilled segment back into VRAM. */
+static void *rehydrate_thread(void *arg)
+{
+	(void)arg;
+	cu.CtxSetCurrent(ctx);
+	prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0);
+	for (;;) {
+		int did = 0;
+		pthread_mutex_lock(&cs.lock);
+		if (cs.sbytes && (cs.bytes - cs.sbytes) * 100 < phys_size * low_pct && cs.nfree >= 4) {
+			uint32_t v = 0;
+			uint64_t newest = 0;
+			for (uint32_t s = cs.nseg; s < cs.nseg + cs.nspill; s++)
+				if (cs.state[s] == SEG_CLOSED && cs.seq[s] > newest)
+					newest = cs.seq[s], v = s;
+			if (newest && !spill_io(0, cs.rebuf, (cs.used[v] + BLK - 1) & ~(size_t)(BLK - 1),
+						(uint64_t)(v - cs.nseg) * SEG)) {
+				size_t out = survivors(cs.rebuf, v, cs.rebuf, 0, SEG, NULL);
+				if (!log_append(cs.rebuf, out)) {
+					cs.returned += out;
+					did = 1;
+				}
+			}
+		}
+		pthread_mutex_unlock(&cs.lock);
+		if (!did)
+			usleep(50000);
+	}
+	return NULL;
+}
+
+/* Empty the closed segment holding the least live data. Fails if none would give much back. */
+static int clean_one(void)
+{
+	uint32_t v = 0, best = UINT32_MAX;
+	size_t out = 0;
+
+	for (uint32_t s = 0; s < cs.nseg; s++)
+		if (cs.state[s] == SEG_CLOSED && cs.live[s] < best)
+			best = cs.live[s], v = s;
+	if (best > SEG - SEG / 16)
+		return ENOSPC;
+	if (vram_rw(0, (uint64_t)v * SEG, cs.gcbuf, cs.used[v]))
+		return EIO;
+	out = survivors(cs.gcbuf, v, cs.gcbuf, 0, SEG, NULL);
+	cs.state[v] = SEG_CLEANING; /* keep it out of the free list until its records have moved */
+	int err = log_append(cs.gcbuf, out);
+	if (err) {
+		cs.state[v] = SEG_CLOSED;
+		return err;
+	}
+	seg_free(v);
+	cs.cleaned++;
+	return 0;
+}
+
+/*
+ * Make room for `need` bytes of records, keeping two segments back for
+ * cleaning to work in. Above the high-water mark every write also pays for
+ * one eviction, so the card drains at the rate it is being filled.
+ */
+static int make_room(size_t need)
+{
+	int over = spill_fd >= 0 && (cs.bytes - cs.sbytes) * 100 > phys_size * high_pct;
+
+	for (;;) {
+		uint64_t avail = (uint64_t)cs.nfree * SEG + SEG - cs.used[cs.open];
+		if (avail >= need + 2 * SEG) {
+			if (over)
+				evict(); /* if the file is full there is still room here */
+			return 0;
+		}
+		int err = over ? evict() : clean_one();
+		if (err == ENOSPC)
+			err = over ? clean_one() : evict();
+		if (err) {
+			cs.refused += err == ENOSPC;
+			return err;
+		}
+	}
+}
+
+static int page_is_zero(const char *p)
+{
+	uint64_t w;
+	memcpy(&w, p, 8);
+	return !w && !memcmp(p, p + 8, BLK - 8);
+}
+
+static int cs_write(uint64_t off, const char *buf, size_t len)
+{
+	uint64_t lpn = off / BLK, zero[MAX_PAGES / 64] = { 0 };
+	size_t n = len / BLK, out = 0;
+	int err = 0;
+
+	if (off % BLK || len % BLK || n > MAX_PAGES)
+		return EINVAL;
+	ct_init();
+	for (size_t i = 0; i < n; i++) {
+		const char *p = buf + i * BLK;
+		if (page_is_zero(p)) {
+			zero[i / 64] |= 1ULL << (i % 64);
+			continue;
+		}
+		size_t c = z.Compress(ct.cc, ct.stage + out + REC_HDR, RAW_ABOVE, p, BLK, clevel);
+		if (z.IsError(c) || !c || c > RAW_ABOVE) {
+			memcpy(ct.stage + out + REC_HDR, p, BLK);
+			c = BLK;
+		}
+		struct rec r = { .lpn = lpn + i, .len = c };
+		memcpy(ct.stage + out, &r, sizeof r);
+		out += REC_HDR + c;
+	}
+	pthread_mutex_lock(&cs.lock);
+	if (out && !(err = make_room(out)))
+		err = log_append(ct.stage, out);
+	if (!err)
+		for (size_t i = 0; i < n; i++)
+			if (zero[i / 64] >> (i % 64) & 1)
+				map_drop(lpn + i);
+	pthread_mutex_unlock(&cs.lock);
+	return err;
+}
+
+static int cs_read(uint64_t off, char *buf, size_t len)
+{
+	uint64_t lpn = off / BLK;
+	size_t n = len / BLK, in = 0;
+	uint32_t pos[MAX_PAGES], clen[MAX_PAGES];
+
+	if (off % BLK || len % BLK || n > MAX_PAGES)
+		return EINVAL;
+	ct_init();
+	pthread_mutex_lock(&cs.lock);
+	for (size_t i = 0; i < n;) {
+		uint64_t e = cs.map[lpn + i], start, end;
+		if (!e) {
+			clen[i++] = 0;
+			continue;
+		}
+		/* take every following page whose record comes straight after, in one copy */
+		size_t first = i;
+		start = E_OFF(e), end = start;
+		do {
+			pos[i] = in + (end - start) + REC_HDR;
+			clen[i] = E_LEN(e);
+			end += REC_HDR + E_LEN(e);
+		} while (++i < n && (e = cs.map[lpn + i]) && E_OFF(e) == end && end != phys_size);
+		int bad;
+		if (start < phys_size) {
+			bad = vram_rw(0, start, ct.stage + in, end - start);
+			in += end - start;
+		} else { /* in the spill file: whole blocks, into a block-aligned place */
+			uint64_t fo = start - phys_size, a = fo & ~(uint64_t)(BLK - 1);
+			size_t al = (in + BLK - 1) & ~(size_t)(BLK - 1), shift = al + (fo - a) - in;
+			size_t span = ((fo + (end - start) + BLK - 1) & ~(uint64_t)(BLK - 1)) - a;
+			for (size_t k = first; k < i; k++)
+				pos[k] += shift;
+			bad = spill_io(0, ct.stage + al, span, a);
+			in = al + span;
+		}
+		if (bad) {
+			pthread_mutex_unlock(&cs.lock);
+			return EIO;
+		}
+	}
+	pthread_mutex_unlock(&cs.lock);
+	for (size_t i = 0; i < n; i++) {
+		char *p = buf + i * BLK;
+		if (!clen[i])
+			memset(p, 0, BLK);
+		else if (clen[i] == BLK)
+			memcpy(p, ct.stage + pos[i], BLK);
+		else if (z.Decompress(ct.dc, p, BLK, ct.stage + pos[i], clen[i]) != BLK) {
+			fprintf(stderr, "vroom: stored page %llu does not decompress\n",
+				(unsigned long long)(lpn + i));
+			return EIO;
+		}
+	}
+	return 0;
+}
+
+/* Discard: the pages read as zeros from now on and their space is given back. */
+static int cs_discard(uint64_t off, uint64_t len)
+{
+	uint64_t first = (off + BLK - 1) / BLK, end = (off + len) / BLK;
+	pthread_mutex_lock(&cs.lock);
+	for (uint64_t p = first; p < end; p++)
+		map_drop(p);
+	pthread_mutex_unlock(&cs.lock);
+	return 0;
+}
+
+/* One read or write of the device, whichever way it is stored. Returns 0 or an errno. */
+static int dev_rw(int wr, uint64_t off, char *buf, size_t len)
+{
+	if (!cratio)
+		return vram_rw(wr, off, buf, len) ? EIO : 0;
+	return wr ? cs_write(off, buf, len) : cs_read(off, buf, len);
+}
+
+/* While serving: keep /run/vroom/DEVICE.stat current for 'vroomctl list', and warn when nearly full. */
+static const char *dev_path;
+static void *stat_thread(void *arg)
+{
+	char path[128], tmp[136];
+	const char *base = strrchr(dev_path, '/');
+	uint64_t last = ~0ULL;
+	int warned = 0;
+
+	(void)arg;
+	mkdir("/run/vroom", 0755);
+	snprintf(path, sizeof path, "/run/vroom/%s.stat", base ? base + 1 : dev_path);
+	snprintf(tmp, sizeof tmp, "%s.tmp", path);
+	for (;; sleep(2)) {
+		pthread_mutex_lock(&cs.lock);
+		uint64_t pages = cs.pages, bytes = cs.bytes - cs.sbytes, refused = cs.refused, sbytes = cs.sbytes;
+		uint64_t held = (uint64_t)(cs.nseg - cs.nfree) * SEG;
+		pthread_mutex_unlock(&cs.lock);
+		int pct = bytes * 100 / phys_size;
+
+		if (spill_fd >= 0)
+			pct = spill_size ? sbytes * 100 / spill_size : 0;
+		if (pct >= 90 && !warned)
+			fprintf(stderr, "vroom: WARNING: the %s is %d%% full of compressed data; "
+					"writes will fail when it is full\n",
+				spill_fd >= 0 ? "spill file" : "VRAM", pct);
+		warned = pct >= 90 ? 1 : pct < 80 ? 0 : warned;
+		if (pages + bytes + refused + sbytes * 3 == last)
+			continue;
+		last = pages + bytes + refused + sbytes * 3;
+		FILE *f = fopen(tmp, "w");
+		if (!f)
+			continue;
+		fprintf(f, "PAGES=%llu\nSTORED_BYTES=%llu\nSEGMENT_BYTES=%llu\nVRAM_BYTES=%llu\nREFUSED=%llu\n"
+			   "SPILLED_BYTES=%llu\nSPILL_BYTES=%llu\n",
+			(unsigned long long)pages, (unsigned long long)bytes, (unsigned long long)held,
+			(unsigned long long)phys_size, (unsigned long long)refused,
+			(unsigned long long)sbytes, (unsigned long long)spill_size);
+		fclose(f);
+		rename(tmp, path);
+	}
+	return NULL;
 }
 
 /* ---- NBD transmission protocol ---- */
@@ -223,8 +819,8 @@ static void *worker(void *arg)
 		switch (cmd) {
 		case NBD_CMD_READ:
 			n = len < BUFSZ ? len : BUFSZ;
-			if (!err && vram_rw(0, off, buf, n))
-				err = EIO;
+			if (!err)
+				err = dev_rw(0, off, buf, n);
 			if (err)
 				break;
 			if (wr_full(fd, &rp, sizeof rp, MSG_MORE))
@@ -236,7 +832,7 @@ static void *worker(void *arg)
 				if (!len)
 					break;
 				n = len < BUFSZ ? len : BUFSZ;
-				if (vram_rw(0, off, buf, n))
+				if (dev_rw(0, off, buf, n))
 					goto out; /* mid-reply: drop the connection */
 			}
 			continue;
@@ -245,13 +841,17 @@ static void *worker(void *arg)
 				n = len < BUFSZ ? len : BUFSZ;
 				if (rd_full(fd, buf, n))
 					goto out;
-				if (!err && vram_rw(1, off, buf, n))
-					err = EIO;
+				if (!err)
+					err = dev_rw(1, off, buf, n);
 				off += n, len -= n;
 			}
 			break;
 		case NBD_CMD_FLUSH:
 			err = 0;
+			break;
+		case NBD_CMD_TRIM:
+			if (!err && cratio)
+				err = cs_discard(off, len);
 			break;
 		case NBD_CMD_DISC:
 			goto out;
@@ -268,7 +868,6 @@ out:
 }
 
 /* ---- kernel NBD attachment ---- */
-static const char *dev_path;
 static int nbd_fd = -1;
 
 /* Is our device listed (first column) in /proc/swaps or /proc/mounts? */
@@ -348,7 +947,8 @@ static void serve_nbd(int threads)
 	if (ioctl(nbd_fd, NBD_SET_BLKSIZE, (unsigned long)BLK) ||
 	    ioctl(nbd_fd, NBD_SET_SIZE_BLOCKS, (unsigned long)(dev_size / BLK)) ||
 	    ioctl(nbd_fd, NBD_SET_FLAGS,
-		  (unsigned long)(NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH | NBD_FLAG_CAN_MULTI_CONN)))
+		  (unsigned long)(NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH | NBD_FLAG_CAN_MULTI_CONN |
+				  (cratio ? NBD_FLAG_SEND_TRIM : 0))))
 		die("configuring %s: %s", dev_path, strerror(errno));
 
 	for (int i = 0; i < threads; i++) {
@@ -361,6 +961,8 @@ static void serve_nbd(int threads)
 		close(sp[0]); /* the kernel holds its own reference */
 	}
 	pthread_create(&t, NULL, sig_thread, &stop_set);
+	if (cratio)
+		pthread_create(&t, NULL, stat_thread, NULL);
 	harden();
 
 	fprintf(stderr, "vroom: serving %llu MiB on %s (nbd, %d threads)\n",
@@ -510,11 +1112,16 @@ static void *ublk_queue(void *arg)
 			case UBLK_IO_OP_WRITE:
 				if (len > ublk_io_bytes || off + len > dev_size)
 					res = -EINVAL;
-				else if (vram_rw((d->op_flags & 0xff) == UBLK_IO_OP_WRITE, off,
-						 buf[tag], len))
-					res = -EIO;
-				else
+				else if ((res = -dev_rw((d->op_flags & 0xff) == UBLK_IO_OP_WRITE, off,
+							buf[tag], len)) == 0)
 					res = len;
+				break;
+			case UBLK_IO_OP_DISCARD:
+			case UBLK_IO_OP_WRITE_ZEROES:
+				if (!cratio || off + len > dev_size)
+					res = -EOPNOTSUPP;
+				else
+					res = cs_discard(off, len) ? -EIO : (int)len;
 				break;
 			case UBLK_IO_OP_FLUSH:
 				res = 0;
@@ -573,7 +1180,13 @@ static void serve_ublk(int threads)
 					    .io_min_shift = 12,
 					    .io_opt_shift = 12,
 					    .max_sectors = ublk_io_bytes >> 9,
-					    .dev_sectors = dev_size >> 9 } };
+					    .dev_sectors = dev_size >> 9 },
+				 .discard = { .discard_granularity = BLK,
+					      .max_discard_sectors = 1 << 21,
+					      .max_write_zeroes_sectors = 1 << 21,
+					      .max_discard_segments = 1 } };
+	if (cratio)
+		p.types |= UBLK_PARAM_TYPE_DISCARD;
 	if ((r = ublk_ctrl(UBLK_U_CMD_SET_PARAMS, &p, sizeof p, 0)))
 		die("ublk: set params: %s", strerror(-r));
 
@@ -594,6 +1207,10 @@ static void serve_ublk(int threads)
 		(unsigned long long)(dev_size / MiB), dev_path, threads);
 
 	pthread_create(&ts, NULL, sig_thread, &stop_set);
+	if (cratio) {
+		pthread_t tstat;
+		pthread_create(&tstat, NULL, stat_thread, NULL);
+	}
 	pthread_join(ts, NULL);
 	ublk_ctrl(UBLK_U_CMD_STOP_DEV, NULL, 0, 0);
 	for (int i = 0; i < threads; i++)
@@ -796,6 +1413,182 @@ static void selftest(int threads)
 	printf("selftest passed\n");
 }
 
+/* ---- self-test of the compressed store ---- */
+
+/* Page contents that depend on the block and how often it has been rewritten: one in
+ * eight all zeros, one in eight incompressible, the rest part noise and part repetition. */
+static void pattern(char *p, uint64_t blk, unsigned ver)
+{
+	uint64_t x = (blk + 1) * 0x9E3779B97F4A7C15ULL ^ (ver + 1) * 0xD6E8FEB86659FD93ULL;
+	x ^= x >> 29, x *= 0xBF58476D1CE4E5B9ULL, x ^= x >> 32, x |= 1;
+	unsigned kind = ver == 255 ? 1 : x % 8;
+	size_t q = kind == 1 ? BLK : (256 + (x >> 8) % 1792) & ~7UL;
+
+	if (!kind) {
+		memset(p, 0, BLK);
+		return;
+	}
+	for (size_t i = 0; i < q; i += 8) {
+		x ^= x << 13, x ^= x >> 7, x ^= x << 17;
+		memcpy(p + i, &x, 8);
+	}
+	for (size_t i = q; i < BLK; i += 8) {
+		uint64_t w = blk * 31 + (i & 56);
+		memcpy(p + i, &w, 8);
+	}
+}
+
+static uint8_t *tver;
+static char *ta, *tb;
+
+static int put_pages(int fd, uint64_t blk, unsigned n, int bump)
+{
+	for (unsigned i = 0; i < n; i++)
+		pattern(ta + i * BLK, blk + i, bump < 0 ? 255 : (tver[blk + i] + bump) % 200);
+	int err = nbd_io(fd, NBD_CMD_WRITE, blk * BLK, ta, n * BLK);
+	if (!err)
+		for (unsigned i = 0; i < n; i++)
+			tver[blk + i] = bump < 0 ? 255 : (tver[blk + i] + bump) % 200;
+	return err;
+}
+
+static void check_pages(int fd, uint64_t blk, unsigned n, const char *when)
+{
+	for (unsigned i = 0; i < n; i++)
+		pattern(ta + i * BLK, blk + i, tver[blk + i]);
+	if (nbd_io(fd, NBD_CMD_READ, blk * BLK, tb, n * BLK) || memcmp(ta, tb, n * BLK))
+		die("selftest: MISMATCH %s, near block %llu", when, (unsigned long long)blk);
+}
+
+static void check_all(int fd, const char *when)
+{
+	uint64_t npages = dev_size / BLK;
+	for (uint64_t b = 0; b < npages; b += MAX_PAGES)
+		check_pages(fd, b, npages - b < MAX_PAGES ? npages - b : MAX_PAGES, when);
+}
+
+static void selftest_compress(int threads)
+{
+	int fds[MAX_THREADS];
+	pthread_t tw[MAX_THREADS], tc[MAX_THREADS];
+	uint64_t npages = dev_size / BLK, x = 2463534242ULL;
+	double t;
+
+	tver = calloc(npages, 1);
+	ta = malloc(BUFSZ), tb = malloc(BUFSZ);
+	for (int i = 0; i < threads; i++) {
+		int sp[2];
+		if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp))
+			die("socketpair: %s", strerror(errno));
+		fds[i] = sp[0];
+		pthread_create(&tw[i], NULL, worker, (void *)(intptr_t)sp[1]);
+	}
+	int fd = fds[0];
+
+	t = now();
+	for (uint64_t b = 0; b < npages; b += MAX_PAGES)
+		if (put_pages(fd, b, npages - b < MAX_PAGES ? npages - b : MAX_PAGES, 0))
+			die("selftest: write failed at block %llu", (unsigned long long)b);
+	printf("sequential write  %7.0f MiB/s\n", dev_size / MiB / (now() - t));
+	printf("stored            %7llu MiB of pages in %llu MiB (%.2fx; the device offers %.2fx)\n",
+	       (unsigned long long)(dev_size / MiB), (unsigned long long)(cs.bytes / MiB),
+	       (double)dev_size / cs.bytes, cratio);
+	if (spill_fd >= 0)
+		printf("                  %7llu MiB of that in VRAM, %llu MiB spilled to the file\n",
+		       (unsigned long long)((cs.bytes - cs.sbytes) / MiB), (unsigned long long)(cs.sbytes / MiB));
+	t = now();
+	check_all(fd, "in sequential read");
+	printf("sequential read   %7.0f MiB/s  (verified)\n", dev_size / MiB / (now() - t));
+
+	/* Rewrite pages at random until the log has wrapped and segments have had to be cleaned. */
+	uint64_t ops = npages < 400000 ? npages : 400000;
+	t = now();
+	for (uint64_t i = 0; i < ops; i++) {
+		x ^= x << 13, x ^= x >> 7, x ^= x << 17;
+		if (put_pages(fd, x % npages, 1, 1))
+			die("selftest: 4K write failed");
+	}
+	double dw = now() - t;
+	printf("4K random write   %7.0f IOPS  (%.1f us each, 1 thread, %llu segments cleaned)\n", ops / dw,
+	       dw / ops * 1e6, (unsigned long long)cs.cleaned);
+	check_all(fd, "after random rewrites");
+	t = now();
+	for (int i = 0; i < RAND_OPS; i++) {
+		x ^= x << 13, x ^= x >> 7, x ^= x << 17;
+		check_pages(fd, x % npages, 1, "in 4K random read");
+	}
+	double dr = now() - t;
+	printf("4K random read    %7.0f IOPS  (%.1f us each, 1 thread, verified)\n", RAND_OPS / dr,
+	       dr / RAND_OPS * 1e6);
+	t = now();
+	for (int i = 0; i < threads; i++)
+		pthread_create(&tc[i], NULL, rand_reader, (void *)(intptr_t)fds[i]);
+	for (int i = 0; i < threads; i++)
+		pthread_join(tc[i], NULL);
+	printf("4K random read    %7.0f IOPS  (%d threads)\n", (double)RAND_OPS * threads / (now() - t),
+	       threads);
+
+	/* Data that does not compress must fill the store, be refused cleanly, and harm nothing. */
+	uint64_t b = 0;
+	int err = 0;
+	for (; b + 64 <= npages && !(err = put_pages(fd, b, 64, -1)); b += 64)
+		;
+	if (spill_fd < 0) {
+		if (err != ENOSPC)
+			die("selftest: filling with incompressible data gave error %d, not ENOSPC", err);
+		check_all(fd, "after the store filled up");
+		printf("incompressible    writes refused once %llu MiB of VRAM was full; contents intact\n",
+		       (unsigned long long)(cs.bytes / MiB));
+	} else {
+		if (err && (err != ENOSPC || spill_size >= dev_size))
+			die("selftest: filling with incompressible data gave error %d", err);
+		t = now();
+		check_all(fd, "after spilling");
+		printf("incompressible    %llu MiB in VRAM, %llu MiB spilled%s; all read back at %.0f MiB/s\n",
+		       (unsigned long long)((cs.bytes - cs.sbytes) / MiB), (unsigned long long)(cs.sbytes / MiB),
+		       err ? ", then refused" : "", dev_size / MiB / (now() - t));
+		/* Free the newest half, which is what is in VRAM: the spilled pages should come back. */
+		uint64_t half = npages / 2 & ~63ULL;
+		for (uint64_t off = half * BLK; off < dev_size; off += 1024 * MiB) {
+			uint64_t n = dev_size - off < 1024 * MiB ? dev_size - off : 1024 * MiB;
+			if (nbd_io(fd, NBD_CMD_TRIM, off, NULL, n))
+				die("selftest: discard failed");
+		}
+		t = now();
+		cs.returned = 0;
+		while (cs.sbytes && (cs.bytes - cs.sbytes) * 100 < phys_size * low_pct && now() - t < 120)
+			usleep(20000);
+		if (cs.sbytes && (cs.bytes - cs.sbytes) * 100 < phys_size * low_pct)
+			die("selftest: spilled pages did not come back to a card with room for them");
+		for (uint64_t c = 0; c < half; c += MAX_PAGES)
+			check_pages(fd, c, half - c < MAX_PAGES ? half - c : MAX_PAGES, "after pages came back");
+		printf("rehydration       %llu MiB came back from the file in %.1f s, %llu MiB left there; verified\n",
+		       (unsigned long long)(cs.returned / MiB), now() - t,
+		       (unsigned long long)(cs.sbytes / MiB));
+	}
+
+	for (uint64_t off = 0; off < dev_size; off += 1024 * MiB) {
+		uint64_t n = dev_size - off < 1024 * MiB ? dev_size - off : 1024 * MiB;
+		if (nbd_io(fd, NBD_CMD_TRIM, off, NULL, n))
+			die("selftest: discard failed");
+	}
+	memset(tver, 0, npages);
+	memset(ta, 0, BLK);
+	if (cs.pages || cs.bytes || nbd_io(fd, NBD_CMD_READ, (npages / 2) * BLK, tb, BLK) || memcmp(ta, tb, BLK))
+		die("selftest: discard did not empty the store");
+	if (put_pages(fd, 7, 3, 1))
+		die("selftest: write after discard failed");
+	check_pages(fd, 7, 3, "after discard");
+	printf("discard               ok\n");
+
+	for (int i = 0; i < threads; i++) {
+		struct nbd_req rq = { htobe32(NBD_REQUEST_MAGIC), htobe32(NBD_CMD_DISC), 0, 0, 0 };
+		wr_full(fds[i], &rq, sizeof rq, 0);
+		pthread_join(tw[i], NULL);
+	}
+	printf("selftest passed\n");
+}
+
 int main(int argc, char **argv)
 {
 	uint64_t size_mib = 0;
@@ -815,10 +1608,29 @@ int main(int argc, char **argv)
 			gpu = atoi(v), i++;
 		else if (!strcmp(argv[i], "--threads") && v)
 			threads = atoi(v), i++;
+		else if (!strcmp(argv[i], "--compress") && v)
+			cratio = atof(v), i++;
+		else if (!strcmp(argv[i], "--zlevel") && v)
+			clevel = atoi(v), i++;
+		else if (!strcmp(argv[i], "--spill") && v)
+			spill_path = *v ? v : NULL, i++;
+		else if (!strcmp(argv[i], "--spill-size") && v)
+			spill_size = strtoull(v, NULL, 10) * MiB, i++;
+		else if (!strcmp(argv[i], "--high") && v)
+			high_pct = atoi(v), i++;
+		else if (!strcmp(argv[i], "--low") && v)
+			low_pct = atoi(v), i++;
 		else
 			die("usage: vroom (--selftest | --dev /dev/nbdN | --dev /dev/ublkbN | --bench DEV)"
-			    " [--size MiB] [--gpu N] [--threads N]");
+			    " [--size MiB] [--gpu N] [--threads N]"
+			    " [--compress RATIO [--spill FILE [--spill-size MiB]]]");
 	}
+	if (cratio && (cratio < 1 || cratio > 8))
+		die("--compress takes how much larger than the VRAM to make the device, 1 to 8 (0: off)");
+	if (spill_path && !cratio)
+		die("--spill needs --compress");
+	if (low_pct < 1 || high_pct > 95 || low_pct + 5 > high_pct)
+		die("--low and --high are percentages of the VRAM, at least 5 apart, at most 95");
 	if (test == !!dev_path)
 		die("give exactly one of --selftest, --dev DEVICE or --bench DEVICE");
 	/*
@@ -846,11 +1658,15 @@ int main(int argc, char **argv)
 	if (!test)
 		block_stop_signals();
 	vram_init(gpu, size_mib);
-	if (test)
+	if (test && cratio)
+		selftest_compress(threads);
+	else if (test)
 		selftest(threads);
 	else if (ublk)
 		serve_ublk(threads);
 	else
 		serve_nbd(threads);
+	if (spill_path)
+		unlink(spill_path);
 	return 0;
 }

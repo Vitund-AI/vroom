@@ -13,6 +13,10 @@
 #   --raw           just the block device, at /dev/vroom/NAME
 #   --backend ublk|nbd   kernel interface (default: ublk when available)
 #   --gpu N         CUDA index of the GPU (0)
+#   --compress      compress pages; the device is RATIO times the VRAM (swap and raw only)
+#   --ratio X       how much larger (1.5; 2.2 with --spill)
+#   --spill PATH    file or directory on a disk for what does not fit in the VRAM
+#   --spill-size MiB   size of that file (default: the size of the device)
 #   --boot          also start at every boot
 # Contents never survive a stop or reboot. Definitions live in /etc/vroom/NAME.conf.
 set -euo pipefail
@@ -28,6 +32,7 @@ load() {
 	[[ $name =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "bad name '$name' (use a-z, 0-9, - and _)"
 	[ -r "$CONF_DIR/$name.conf" ] || die "no such device: $name (see 'vroomctl list')"
 	VROOM_SIZE_MIB=0 VROOM_MODE=swap VROOM_PRIO=100 VROOM_MOUNT='' VROOM_MOUNT_MODE=1777
+	VROOM_COMPRESS=0 VROOM_SPILL='' VROOM_SPILL_MIB=0
 	# shellcheck disable=SC1090
 	. "$CONF_DIR/$name.conf"
 	DEV=$VROOM_DEV
@@ -85,6 +90,7 @@ add)
 	[[ $name =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "usage: vroomctl add NAME [options]; NAME uses a-z, 0-9, - and _"
 	shift
 	size=0 mode=swap prio=100 mnt='' mntmode=1777 backend='' gpu=0 boot=0
+	compress=0 ratio='' spill='' spillsize=0
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--size) size=${2:?}; shift ;;
@@ -96,6 +102,10 @@ add)
 		--backend) backend=${2:?}; shift ;;
 		--gpu) gpu=${2:?}; shift ;;
 		--boot) boot=1 ;;
+		--compress) compress=1 ;;
+		--ratio) compress=1; ratio=${2:?}; shift ;;
+		--spill) compress=1; spill=${2:?}; shift ;;
+		--spill-size) spillsize=${2:?}; shift ;;
 		*) die "unknown option: $1" ;;
 		esac
 		shift
@@ -109,6 +119,20 @@ add)
 		fi
 	fi
 	[ -e "$CONF_DIR/$name.conf" ] && die "$name already exists (vroomctl remove $name)"
+	if [ "$compress" = 1 ]; then
+		# A full compressed store refuses writes: swap survives that, a filesystem does not.
+		[ "$mode" = mount ] && die "--compress is for --swap and --raw, not --mount"
+		[ -n "$ratio" ] || { [ -n "$spill" ] && ratio=2.2 || ratio=1.5; }
+		[[ $ratio =~ ^[1-7](\.[0-9]+)?$ ]] || die "--ratio takes a number from 1 to 8, such as 1.5"
+		[[ $spillsize =~ ^[0-9]+$ ]] || die "--spill-size takes a number of MiB"
+		if [ -n "$spill" ]; then
+			[[ $spill == /* && $spill != *[[:space:]]* ]] || die "--spill needs an absolute path without spaces"
+			[ -d "$spill" ] && spill=${spill%/}/vroom-$name.spill
+			[ -d "$(dirname "$spill")" ] || die "--spill: no directory $(dirname "$spill")"
+		fi
+	else
+		ratio=0
+	fi
 	if [ -z "$backend" ]; then
 		if modinfo ublk_drv >/dev/null 2>&1; then backend=ublk; else backend=nbd; fi
 	fi
@@ -121,6 +145,8 @@ add)
 		echo "VROOM_SIZE_MIB=$size"
 		echo "VROOM_GPU=$gpu"
 		echo "VROOM_MODE=$mode"
+		echo "VROOM_COMPRESS=$ratio"
+		[ -n "$spill" ] && printf 'VROOM_SPILL=%s\nVROOM_SPILL_MIB=%s\n' "$spill" "$spillsize"
 		[ "$mode" = swap ] && echo "VROOM_PRIO=$prio"
 		[ "$mode" = mount ] && printf 'VROOM_MOUNT=%s\nVROOM_MOUNT_MODE=%s\n' "$mnt" "$mntmode"
 	} > "$conf"
@@ -179,6 +205,13 @@ list | status)
 			;;
 		raw) use="raw, /dev/vroom/$name" ;;
 		esac
+		if [ "$state" = active ] && [ -r "/run/vroom/$kname.stat" ]; then
+			use="$use; $(. "/run/vroom/$kname.stat"; awk -v p="$PAGES" -v b="$STORED_BYTES" \
+				-v v="$VRAM_BYTES" -v s="$SPILLED_BYTES" -v r="$REFUSED" 'BEGIN {
+				printf "compressed %.2fx, VRAM %d%% full", b + s ? p * 4096 / (b + s) : 1, b * 100 / v
+				if (s) printf ", %d MiB on disk", s / 1048576
+				if (r) printf ", %d WRITES REFUSED (full)", r }')"
+		fi
 		printf '%-12s %-9s %-13s %9s  %s\n' "$name" "$state" "$DEV" "$size" "$use"
 	done
 	if command -v nvidia-smi >/dev/null; then
@@ -218,7 +251,12 @@ _attach) # ExecStartPost: the daemon is starting; wait for the device, then put 
 	case "$VROOM_MODE" in
 	swap)
 		mkswap -L "${label:0:15}" "$DEV" >/dev/null
-		swapon -p "$VROOM_PRIO" "$DEV"
+		# A compressed store wants to hear when the kernel frees swap, so it can free it too.
+		if [ "$VROOM_COMPRESS" != 0 ]; then
+			swapon --discard -p "$VROOM_PRIO" "$DEV"
+		else
+			swapon -p "$VROOM_PRIO" "$DEV"
+		fi
 		;;
 	mount)
 		# Contents are volatile, so no journal and no reserved blocks.
@@ -234,7 +272,7 @@ _detach) # ExecStop: must succeed before the daemon is asked to exit
 	detach
 	;;
 *)
-	sed -n '2,18p' "$0" >&2
+	sed -n '2,22p' "$0" >&2
 	exit 1
 	;;
 esac
