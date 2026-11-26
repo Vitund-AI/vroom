@@ -307,7 +307,8 @@ stats)
 			if (!(k in perf)) return 0
 			split(perf[k], f, " ")
 			if (!f[2]) return 0
-			printf "  %-9s %-5s %10s %8s %11s", what, dir, size(f[3]), count(f[2]), rate(f[4])
+			printf "  %-9s %-5s %10s %8s %11s %11s", what, dir, size(f[3]), count(f[2]), \
+				f[18] > 0 ? rate(f[17] / f[18] * 1e9) : "-", rate(f[4])
 			for (w = 0; w < 2; w++) {
 				o = 5 + w * 6
 				printf "   %11s %8s %8s %8s", rate(f[o + 2]), took(f[o + 3]), took(f[o + 4]), took(f[o + 5])
@@ -343,15 +344,19 @@ stats)
 			else if (v["CIPHER"] == "none") c = "none: pages are on the card as they are"
 			if (c != "") printf "  %-12s %s\n", "encryption", c
 			if (!("req_read" in perf)) exit
-			printf "\n  %-15s %31s   %38s   %38s\n", "", "---------- since start --------", \
+			printf "\n  %-15s %43s   %38s   %38s\n", "", "---------------- since start --------------", \
 				"------------- last 60 s --------------", "------------- last 5 min -------------"
-			printf "  %-15s %10s %8s %11s   %11s %8s %8s %8s   %11s %8s %8s %8s\n", "", "total", "count", \
-				"peak", "rate", "p50", "p95", "p99", "rate", "p50", "p95", "p99"
+			printf "  %-15s %10s %8s %11s %11s   %11s %8s %8s %8s   %11s %8s %8s %8s\n", "", "total", "count", \
+				"speed", "peak rate", "rate", "p50", "p95", "p99", "rate", "p50", "p95", "p99"
 			n = row("requests", "read", "req_read") + row("", "write", "req_write")
 			n += row("VRAM", "read", "vram_read") + row("", "write", "vram_write")
 			n += row("spill", "read", "disk_read") + row("", "write", "disk_write")
 			if (!n) print "  nothing read or written yet"
-			else printf "  times are of 1 operation in %d; the peak is the busiest %d seconds\n", v["SAMPLE"], 2
+			else {
+				print "  speed: how fast data moves while an operation is under way."
+				print "  rate:  how much moved per second of real time; the peak is the busiest 2 seconds."
+				printf "  speed and times come from timing 1 operation in %d.\n", v["SAMPLE"]
+			}
 		}' "/run/vroom/$kname.stat" 2>/dev/null || echo "$name ($DEV): no figures from its daemon"
 		if [ -r "/run/vroom/$kname.count" ]; then
 			(. "/run/vroom/$kname.count"; awk -v w="$WRITES" -v z="$ZERO" -v sb="$SAME_BLOCK" \

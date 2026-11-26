@@ -344,13 +344,27 @@ static struct {
 	uint8_t *state;
 	uint64_t *seq;	 /* when it was opened, for finding the oldest */
 	uint16_t *pins;	 /* readers at work in a spill segment, which must not be rewritten meanwhile */
+	uint8_t *hits;	 /* reads in a row that each went a little further into a spill segment */
+	uint32_t *lastoff; /* where in the segment the last of them ended */
+	/*
+	 * Spill segments being read through in order are read once, whole, and
+	 * kept here: a megabyte in one read costs about three single pages.
+	 */
+	struct held {
+		uint32_t seg;
+		uint64_t seq, used; /* which writing of that segment; when last used */
+		int valid, loading;
+		char *buf;
+	} held[16];
+	uint64_t held_clock, held_hits;
+	pthread_cond_t wake;
 	uint32_t *freelist, nseg, nfree, open;
 	uint32_t *sfree, nspill, nsfree; /* spill segments are numbered nseg onwards */
 	char *gcbuf, *evbuf, *rebuf;
 	uint64_t clock;
 	uint64_t pages, recs, bytes, sbytes; /* pages held, the records behind them, their bytes, and how much of that is spilled */
 	uint64_t cleaned, refused, evicted, returned;
-} cs = { .lock = PTHREAD_MUTEX_INITIALIZER };
+} cs = { .lock = PTHREAD_MUTEX_INITIALIZER, .wake = PTHREAD_COND_INITIALIZER };
 
 static const char *spill_path;
 static int spill_fd = -1;
@@ -483,6 +497,13 @@ static void cs_init(void)
 	cs.used = calloc(all, sizeof *cs.used);
 	cs.seq = calloc(all, sizeof *cs.seq);
 	cs.pins = calloc(all, sizeof *cs.pins);
+	cs.hits = calloc(all, 1);
+	cs.lastoff = calloc(all, sizeof *cs.lastoff);
+	for (int i = 0; spill_path && i < 16; i++)
+		if (posix_memalign(&p, BLK, SEG))
+			die("out of memory for the spill read-ahead");
+		else
+			cs.held[i].buf = p;
 	cs.state = calloc(all, 1);
 	cs.freelist = calloc(cs.nseg, sizeof *cs.freelist);
 	cs.sfree = calloc(cs.nspill + 1, sizeof *cs.sfree);
@@ -496,7 +517,7 @@ static void cs_init(void)
 		p = NULL;
 	cs.rebuf = p;
 	if (!cs.map || !cs.rloc || !cs.rfp || !cs.rref || !cs.idx || !cs.live || !cs.used || !cs.seq ||
-	    !cs.pins || !cs.state || !cs.freelist || !cs.sfree || !cs.gcbuf || !cs.evbuf || !cs.rebuf)
+	    !cs.pins || !cs.hits || !cs.lastoff || !cs.state || !cs.freelist || !cs.sfree || !cs.gcbuf || !cs.evbuf || !cs.rebuf)
 		die("out of memory for the compressed store's tables");
 	for (uint32_t id = 1; id <= cs.rmax; id++)
 		cs.rref[id] = id < cs.rmax ? id + 1 : 0;
@@ -532,10 +553,19 @@ static void seg_free(uint32_t s)
 {
 	cs.state[s] = SEG_FREE;
 	cs.used[s] = 0;
+	cs.hits[s] = 0;
 	if (s < cs.nseg)
 		cs.freelist[cs.nfree++] = s;
 	else
 		cs.sfree[cs.nsfree++] = s;
+}
+
+/* What we hold of a spill segment is no longer what the file holds. */
+static void held_drop(uint32_t s)
+{
+	for (int i = 0; i < 16; i++)
+		if (cs.held[i].seg == s)
+			cs.held[i].valid = 0, cs.held[i].seq = 0;
 }
 
 /* A record's bytes arrive at (add) or leave the place e describes. */
@@ -796,39 +826,46 @@ static int evict(void)
 		rec_place(r.id, E_MAKE((uint64_t)slot * SEG + pos, r.len));
 	}
 	cs.used[slot] = out;
+	cs.hits[slot] = 0;
+	held_drop(slot);
 	cs.seq[slot] = ++cs.clock;
 	cs.state[slot] = SEG_CLOSED;
 	cs.evicted += out - own;
 	return 0;
 }
 
-/* Below the low-water mark, bring the most recently spilled segment back into VRAM. */
+/* While the card is below its low-water mark, bring the most recently spilled segment back. */
 static void *rehydrate_thread(void *arg)
 {
 	(void)arg;
 	cu.CtxSetCurrent(ctx);
 	prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0);
+	pthread_mutex_lock(&cs.lock);
 	for (;;) {
-		int did = 0;
-		pthread_mutex_lock(&cs.lock);
-		if (cs.sbytes && (cs.bytes - cs.sbytes) * 100 < phys_size * low_pct && cs.nfree >= 4) {
-			uint32_t v = 0;
-			uint64_t newest = 0;
+		uint32_t v = 0;
+		uint64_t newest = 0;
+
+		if (cs.sbytes && (cs.bytes - cs.sbytes) * 100 < phys_size * low_pct && cs.nfree >= 4)
 			for (uint32_t s = cs.nseg; s < cs.nseg + cs.nspill; s++)
 				if (cs.state[s] == SEG_CLOSED && cs.seq[s] > newest)
 					newest = cs.seq[s], v = s;
-			if (newest && !spill_io(0, cs.rebuf, (cs.used[v] + BLK - 1) & ~(size_t)(BLK - 1),
-						(uint64_t)(v - cs.nseg) * SEG)) {
-				size_t out = survivors(cs.rebuf, v, cs.rebuf, 0, SEG, NULL);
-				if (!log_append(cs.rebuf, out)) {
-					cs.returned += out;
-					did = 1;
-				}
-			}
-		}
-		pthread_mutex_unlock(&cs.lock);
-		if (!did)
+		if (!newest) {
+			pthread_mutex_unlock(&cs.lock);
 			usleep(50000);
+			pthread_mutex_lock(&cs.lock);
+			continue;
+		}
+		size_t span = (cs.used[v] + BLK - 1) & ~(size_t)(BLK - 1);
+		cs.pins[v]++; /* nothing may rewrite it while we read it with the lock dropped */
+		pthread_mutex_unlock(&cs.lock);
+		int ok = !spill_io(0, cs.rebuf, span, (uint64_t)(v - cs.nseg) * SEG);
+		pthread_mutex_lock(&cs.lock);
+		cs.pins[v]--;
+		if (ok && cs.state[v] == SEG_CLOSED && cs.seq[v] == newest && cs.nfree >= 4) {
+			size_t out = survivors(cs.rebuf, v, cs.rebuf, 0, SEG, NULL);
+			if (!log_append(cs.rebuf, out))
+				cs.returned += out;
+		}
 	}
 	return NULL;
 }
@@ -978,6 +1015,9 @@ static int cs_read(uint64_t off, char *buf, size_t len)
 		uint64_t at, start, end;
 		size_t to, span;
 	} sp[MAX_PAGES]; /* reads of the spill file, done once the lock is dropped */
+	struct held *load = NULL; /* a whole segment this request reads to keep */
+	uint64_t load_from = 0;
+	size_t load_to = 0, load_len = 0, load_span = 0;
 	int bad = 0;
 
 	if (off % BLK || len % BLK || n > MAX_PAGES)
@@ -1003,6 +1043,40 @@ static int cs_read(uint64_t off, char *buf, size_t len)
 			in += end - start;
 			continue;
 		}
+		uint32_t g = start / SEG;
+		uint64_t in_seg = start - (uint64_t)g * SEG;
+		if ((end - 1) / SEG == g) {
+			struct held *h = NULL, *spare = NULL;
+			for (int k = 0; k < 16; k++) {
+				struct held *c = &cs.held[k];
+				if (c->valid && c->seg == g && c->seq == cs.seq[g])
+					h = c;
+				if (!c->loading && (!spare || c->used < spare->used))
+					spare = c;
+			}
+			if (h) { /* already in memory */
+				memcpy(ct.stage + in, h->buf + in_seg, end - start);
+				h->used = ++cs.held_clock;
+				cs.held_hits++;
+				in += end - start;
+				continue;
+			}
+			/* Three reads in a row each a little further on: someone is reading through it. */
+			if (in_seg >= cs.lastoff[g] && in_seg - cs.lastoff[g] <= 131072 && cs.hits[g] < 255)
+				cs.hits[g]++;
+			else
+				cs.hits[g] = 1;
+			cs.lastoff[g] = end - (uint64_t)g * SEG;
+			if (cs.hits[g] >= 3 && !load && spare) {
+				load = spare;
+				*load = (struct held){ .seg = g, .seq = cs.seq[g], .loading = 1, .buf = spare->buf };
+				load_from = in_seg, load_to = in, load_len = end - start;
+				load_span = (cs.used[g] + BLK - 1) & ~(size_t)(BLK - 1);
+				cs.pins[g]++;
+				in += end - start;
+				continue;
+			}
+		}
 		/*
 		 * In the spill file: whole blocks, into a block-aligned place, and
 		 * not while holding the lock, which everything else needs. What is
@@ -1015,14 +1089,26 @@ static int cs_read(uint64_t off, char *buf, size_t len)
 			pos[k] += shift;
 		sp[nsp].at = a, sp[nsp].to = al, sp[nsp].start = start, sp[nsp].end = end;
 		sp[nsp].span = ((fo + (end - start) + BLK - 1) & ~(uint64_t)(BLK - 1)) - a;
-		for (uint64_t g = start / SEG; g <= (end - 1) / SEG; g++)
-			cs.pins[g]++;
+		for (uint64_t s2 = start / SEG; s2 <= (end - 1) / SEG; s2++)
+			cs.pins[s2]++;
 		in = al + sp[nsp++].span;
 	}
 	pthread_mutex_unlock(&cs.lock);
 	for (size_t k = 0; k < nsp; k++)
 		if (!bad)
 			bad = spill_io(0, ct.stage + sp[k].to, sp[k].span, sp[k].at);
+	if (load) {
+		int failed = spill_io(0, load->buf, load_span, (uint64_t)(load->seg - cs.nseg) * SEG);
+		if (!failed)
+			memcpy(ct.stage + load_to, load->buf + load_from, load_len);
+		bad |= failed;
+		pthread_mutex_lock(&cs.lock);
+		cs.pins[load->seg]--;
+		load->loading = 0;
+		load->valid = !failed && load->seq == cs.seq[load->seg] && cs.state[load->seg] == SEG_CLOSED;
+		load->used = ++cs.held_clock;
+		pthread_mutex_unlock(&cs.lock);
+	}
 	if (nsp) {
 		pthread_mutex_lock(&cs.lock);
 		for (size_t k = 0; k < nsp; k++)
@@ -1296,7 +1382,8 @@ static void *stat_thread(void *arg)
 		/*
 		 * One line for each kind of operation:
 		 * #perf KIND total-ops total-bytes peak-bytes/s, then for each window
-		 * its length in seconds, ops/s, bytes/s and the p50, p95 and p99 time in ns.
+		 * its length in seconds, ops/s, bytes/s and the p50, p95 and p99 time in ns;
+		 * last, the bytes and the nanoseconds of the operations that were timed.
 		 */
 		for (int k = 0; k < P_KINDS; k++) {
 			fprintf(f, "#perf %s %llu %llu %.0f", kind[k], (unsigned long long)cur[k].ops,
@@ -1311,7 +1398,7 @@ static void *stat_thread(void *arg)
 					hist_quantile(&cur[k], old, 0.50), hist_quantile(&cur[k], old, 0.95),
 					hist_quantile(&cur[k], old, 0.99));
 			}
-			fputc('\n', f);
+			fprintf(f, " %llu %llu\n", (unsigned long long)cur[k].t_bytes, (unsigned long long)cur[k].t_ns);
 		}
 		fclose(f);
 		rename(tmp, path);
@@ -2300,6 +2387,16 @@ static void selftest_compress(int threads)
 			       (double)RAND_OPS * k / (now() - t), k, k > 1 ? "s" : "",
 			       (unsigned long long)(cs.sbytes * 100 / cs.bytes));
 		}
+		/* Page by page in the order written, as swap comes back in: mostly from the file's read-ahead. */
+		uint64_t walk = npages / 4 < 60000 ? npages / 4 : 60000, hits0 = cs.held_hits;
+		uint64_t dr0 = perf[P_DISK_READ].ops;
+		t = now();
+		for (uint64_t c = 0; c < walk; c++)
+			check_pages(fd, c, 1, "reading through spilled pages");
+		printf("4K in order       %7.0f IOPS  (1 thread; %llu disk reads for %llu pages)\n",
+		       walk / (now() - t), (unsigned long long)(perf[P_DISK_READ].ops - dr0),
+		       (unsigned long long)walk);
+		(void)hits0;
 		/* Free the newest half, which is what is in VRAM: the spilled pages should come back. */
 		uint64_t half = npages / 2 & ~63ULL;
 		for (uint64_t off = half * BLK; off < dev_size; off += 1024 * MiB) {
