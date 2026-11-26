@@ -274,6 +274,11 @@ Ideas, not promises:
 - **Keep one copy of identical pages.** `VROOM_COUNT=1` exists to find out
   how often that would help.
 - **Learn the water marks** for spilling instead of fixing them at 90% and 70%.
+- **Give VRAM back when something else wants it.** Watch how much of the
+  card other programs are using and, between a high and a low mark, move
+  pages to the spill file and release whole 256 MiB allocations, taking
+  them back later. It can only keep room free in advance: an allocation by
+  another program fails at once, with no chance to make room for it.
 - **Do not hold up other reads** while one waits for the spill file.
 - **GPUs other than NVIDIA's**, through Vulkan or OpenCL.
 
