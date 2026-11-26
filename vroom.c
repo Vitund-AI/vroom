@@ -1717,16 +1717,19 @@ static void ring_poll(struct ring *r, int fd, uint64_t ud)
 #define UBLK_DEPTH 32
 #define UBLK_IO_BYTES (256 * 1024)
 #define POLL_UD UINT64_MAX
-#define SLOW_READERS 4
+#define HELPERS 6
 
 /*
- * A queue is one thread, and a read that has to go to the spill file takes
- * the disk's time, not the card's. Such reads are handed to helper threads so
- * that the queue keeps serving what is on the card; a helper says it has
- * finished through the queue's eventfd, and the queue completes the request.
+ * A queue is one thread, and what it does itself holds up everything behind
+ * it. So it keeps only what is quick: reads of what is on the card, which is
+ * what a stopped process is usually waiting for. A read that has to go to the
+ * spill file takes the disk's time, and a write to a compressed device takes
+ * a core's time to compress and encrypt; both are handed to helper threads,
+ * reads ahead of writes. A helper says it has finished through the queue's
+ * eventfd, and the queue completes the request.
  */
 struct slow {
-	int q;
+	int q, wr;
 	unsigned tag;
 	uint64_t off;
 	uint32_t len;
@@ -1737,8 +1740,8 @@ struct slow {
 static struct {
 	pthread_mutex_t lock;
 	pthread_cond_t more;
-	struct slow *head, *tail;
-} slowq = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, NULL };
+	struct slow *head[2], *tail[2]; /* reads, writes */
+} slowq = { .lock = PTHREAD_MUTEX_INITIALIZER, .more = PTHREAD_COND_INITIALIZER };
 static struct {
 	pthread_mutex_t lock;
 	struct slow *done;
@@ -1752,14 +1755,15 @@ static void *slow_reader(void *arg)
 	prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0);
 	for (;;) {
 		pthread_mutex_lock(&slowq.lock);
-		while (!slowq.head)
+		while (!slowq.head[0] && !slowq.head[1])
 			pthread_cond_wait(&slowq.more, &slowq.lock);
-		struct slow *j = slowq.head;
-		if (!(slowq.head = j->next))
-			slowq.tail = NULL;
+		int w = !slowq.head[0]; /* a read, if one is waiting */
+		struct slow *j = slowq.head[w];
+		if (!(slowq.head[w] = j->next))
+			slowq.tail[w] = NULL;
 		pthread_mutex_unlock(&slowq.lock);
 
-		int err = dev_rw(0, j->off, j->buf, j->len);
+		int err = dev_rw(j->wr, j->off, j->buf, j->len);
 		j->res = err ? -err : (int)j->len;
 		pthread_mutex_lock(&qdone[j->q].lock);
 		j->next = qdone[j->q].done;
@@ -1795,7 +1799,7 @@ static void *ublk_queue(void *arg)
 	struct ring ring;
 	char *buf[UBLK_DEPTH];
 	struct slow *slow = calloc(UBLK_DEPTH, sizeof *slow);
-	int handoff = spill_fd >= 0;
+	int handoff = cratio != 0;
 
 	cu.CtxSetCurrent(ctx);
 	prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0);
@@ -1830,11 +1834,17 @@ static void *ublk_queue(void *arg)
 	for (unsigned live = UBLK_DEPTH; live;) {
 		if ((r = ring_enter(&ring, 1)))
 			die("ublk: io_uring_enter: %s", strerror(-r));
-		unsigned head = *ring.cq_head, tail = __atomic_load_n(ring.cq_tail, __ATOMIC_ACQUIRE);
-		for (; head != tail; head++) {
+		unsigned first = *ring.cq_head, tail = __atomic_load_n(ring.cq_tail, __ATOMIC_ACQUIRE), head;
+		/* Everything that has arrived, twice over: reads and the rest first, then the writes. */
+		for (int writes = 0; writes < 2; writes++)
+		for (head = first; head != tail; head++) {
 			struct io_uring_cqe *e = &ring.cqes[head & *ring.cq_mask];
 			unsigned tag = e->user_data;
-			if (e->user_data == POLL_UD) { /* helpers have finished some reads */
+			int is_write = e->user_data != POLL_UD && e->res == UBLK_IO_RES_OK &&
+				       (iod[tag].op_flags & 0xff) == UBLK_IO_OP_WRITE;
+			if (is_write != writes)
+				continue;
+			if (e->user_data == POLL_UD) { /* helpers have finished some requests */
 				uint64_t v;
 				if (read(qdone[q].efd, &v, sizeof v) < 0 && errno != EAGAIN)
 					die("ublk: eventfd: %s", strerror(errno));
@@ -1862,16 +1872,17 @@ static void *ublk_queue(void *arg)
 			const struct ublksrv_io_desc *d = &iod[tag];
 			uint64_t off = d->start_sector << 9, len = (uint64_t)d->nr_sectors << 9;
 			int res;
-			if (handoff && (d->op_flags & 0xff) == UBLK_IO_OP_READ && len <= ublk_io_bytes &&
-			    off + len <= dev_size && cs_reads_spill(off, len)) {
+			if (handoff && len <= ublk_io_bytes && off + len <= dev_size &&
+			    (is_write || ((d->op_flags & 0xff) == UBLK_IO_OP_READ && cs_reads_spill(off, len)))) {
 				struct slow *j = &slow[tag];
-				*j = (struct slow){ .q = q, .tag = tag, .off = off, .len = len, .buf = buf[tag] };
+				*j = (struct slow){ .q = q, .wr = is_write, .tag = tag, .off = off, .len = len,
+						    .buf = buf[tag] };
 				pthread_mutex_lock(&slowq.lock);
-				if (slowq.tail)
-					slowq.tail->next = j;
+				if (slowq.tail[is_write])
+					slowq.tail[is_write]->next = j;
 				else
-					slowq.head = j;
-				slowq.tail = j;
+					slowq.head[is_write] = j;
+				slowq.tail[is_write] = j;
 				pthread_cond_signal(&slowq.more);
 				pthread_mutex_unlock(&slowq.lock);
 				continue; /* completed when a helper reports back */
@@ -1966,7 +1977,7 @@ static void serve_ublk(int threads)
 		usleep(100000); /* udev may still be creating the node */
 	}
 
-	for (int i = 0; spill_fd >= 0 && i < SLOW_READERS; i++) {
+	for (int i = 0; cratio && i < HELPERS; i++) {
 		pthread_t t;
 		pthread_create(&t, NULL, slow_reader, NULL);
 	}
