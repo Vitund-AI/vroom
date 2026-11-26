@@ -420,6 +420,7 @@ static struct {
 	uint64_t clock;
 	uint64_t pages, recs, bytes, sbytes; /* pages held, the records behind them, their bytes, and how much of that is spilled */
 	uint64_t cleaned, refused, evicted, returned;
+	uint64_t reread, mended, lost; /* pages that failed their check: right at a second reading, put right, or gone */
 } cs = { .lock = PTHREAD_MUTEX_INITIALIZER, .wake = PTHREAD_COND_INITIALIZER,
 	 .room = PTHREAD_COND_INITIALIZER };
 
@@ -434,6 +435,7 @@ static void *keeper_thread(void *arg);
 static __thread struct {
 	void *cc, *dc, *seal, *open, *print;
 	char *stage;
+	char *fix, *work; /* for rescue(): a record as it was read, and a copy to try things on */
 } ct;
 
 static int page_print(const char *page, struct fp *f);
@@ -448,6 +450,9 @@ static void ct_init(void)
 	if (cu.MemAllocHost(&p, sz) && posix_memalign(&p, BLK, sz))
 		die("cannot allocate staging buffer");
 	ct.stage = p;
+	if (posix_memalign(&p, BLK, 6 * BLK))
+		die("cannot allocate staging buffer");
+	ct.fix = memset(p, 0, 6 * BLK), ct.work = ct.fix + 3 * BLK;
 	ct.cc = z.CreateCCtx();
 	ct.dc = z.CreateDCtx();
 	ct.seal = ev.CtxNew();
@@ -1280,6 +1285,95 @@ static int cs_write(uint64_t off, const char *buf, size_t len)
 	return err;
 }
 
+/*
+ * A record has failed its check. Neither the card's memory nor, usually, the
+ * machine's corrects errors by itself, so before the page is given up for
+ * lost: read the record again, which puts right a fault on the way here; and
+ * if it is still wrong, try it with each of its bits turned over in turn,
+ * which finds a single bit that has flipped where it lay. The authenticator
+ * says when the right one has been found (a wrong one passing is a chance of
+ * about 1 in 2^110), and the record is then put right where it is stored.
+ * Some tens of milliseconds at worst, for something that should never happen.
+ */
+static int rescue(uint64_t lpn, char *p)
+{
+	struct rec r;
+	uint64_t e, seq = 0, at = 0;
+	uint32_t id, non;
+	size_t len, total, skew = 0;
+	long bit = -1, nbits;
+	int err, spilled, mended = 0;
+	char *stored, *work = ct.work;
+
+	pthread_mutex_lock(&cs.lock);
+	id = cs.map[lpn], e = cs.rloc[id], non = cs.rnon[id];
+	if (!e) { /* written again meanwhile, as zeros */
+		pthread_mutex_unlock(&cs.lock);
+		memset(p, 0, BLK);
+		return 0;
+	}
+	len = E_LEN(e), total = REC_HDR + len, spilled = E_OFF(e) >= phys_size;
+	if (!spilled)
+		err = vram_rw(0, E_OFF(e), ct.fix, total);
+	else {
+		at = (E_OFF(e) - phys_size) & ~(uint64_t)(BLK - 1), skew = E_OFF(e) - phys_size - at;
+		seq = cs.seq[E_OFF(e) / SEG];
+		err = spill_io(0, ct.fix, (skew + total + BLK - 1) & ~(size_t)(BLK - 1), at);
+	}
+	pthread_mutex_unlock(&cs.lock);
+	stored = ct.fix + skew, nbits = (long)total * 8;
+	for (; !err; bit++) {
+		if (bit == nbits) {
+			err = EIO;
+			break;
+		}
+		memcpy(work, stored, total);
+		if (bit >= 0)
+			work[bit >> 3] ^= 1 << (bit & 7);
+		memcpy(&r, work, sizeof r);
+		if (r.id == id && r.len == len && (uint32_t)r.nonce == non && !rec_crypt(0, &r, work + REC_HDR))
+			break;
+	}
+	if (!err && len < BLK && z.Decompress(ct.dc, p, BLK, work + REC_HDR, len) != BLK)
+		err = EIO;
+	else if (!err && len == BLK)
+		memcpy(p, work + REC_HDR, BLK);
+
+	pthread_mutex_lock(&cs.lock);
+	if (err)
+		cs.lost++;
+	else if (bit < 0)
+		cs.reread++;
+	else {
+		cs.mended++;
+		stored[bit >> 3] ^= 1 << (bit & 7);
+		/* put it right where it lies, unless it has moved or gone since */
+		if (cs.rloc[id] == e && cs.rnon[id] == non && !spilled)
+			mended = !vram_rw(1, E_OFF(e) + (bit >> 3), stored + (bit >> 3), 1);
+		else if (cs.rloc[id] == e && cs.rnon[id] == non && cs.seq[E_OFF(e) / SEG] == seq) {
+			size_t blk = (skew + (bit >> 3)) & ~(size_t)(BLK - 1);
+			mended = !spill_io(1, ct.fix + blk, BLK, at + blk);
+			for (int k = 0; k < 16; k++)
+				if (cs.held[k].valid && cs.held[k].seg == E_OFF(e) / SEG)
+					cs.held[k].valid = 0;
+		}
+	}
+	pthread_mutex_unlock(&cs.lock);
+	if (say()) {
+		const char *where = spilled ? "on the spill disk" : "in VRAM";
+		if (err)
+			fprintf(stderr, "vroom: stored page %llu (%s) has been altered or damaged beyond repair\n",
+				(unsigned long long)lpn, where);
+		else if (bit < 0)
+			fprintf(stderr, "vroom: stored page %llu (%s) read wrong once and right the second time\n",
+				(unsigned long long)lpn, where);
+		else
+			fprintf(stderr, "vroom: stored page %llu (%s) had one bit flipped: found%s\n",
+				(unsigned long long)lpn, where, mended ? " and put right" : "");
+	}
+	return err ? EIO : 0;
+}
+
 static int cs_read(uint64_t off, char *buf, size_t len)
 {
 	uint64_t lpn = off / BLK;
@@ -1410,10 +1504,9 @@ static int cs_read(uint64_t off, char *buf, size_t len)
 		 * someone who can write to it.
 		 */
 		if (r.len != clen[i] || (uint32_t)r.nonce != non[i] || rec_crypt(0, &r, data)) {
-			if (say())
-				fprintf(stderr, "vroom: stored page %llu has been altered or damaged\n",
-					(unsigned long long)(lpn + i));
-			return EIO;
+			if (rescue(lpn + i, p))
+				return EIO;
+			continue;
 		}
 		if (r.len == BLK)
 			memcpy(p, data, BLK);
@@ -1629,7 +1722,7 @@ static void *stat_thread(void *arg)
 	for (unsigned tick = 0;; tick++, sleep(TICK)) {
 		pthread_mutex_lock(&cs.lock);
 		uint64_t pages = cs.pages, bytes = cs.bytes - cs.sbytes, refused = cs.refused, sbytes = cs.sbytes;
-		uint64_t recs = cs.recs, waits = cs.waits;
+		uint64_t recs = cs.recs, waits = cs.waits, reread = cs.reread, mended = cs.mended, lost = cs.lost;
 		uint64_t held = (uint64_t)(cs.nseg - cs.nfree) * SEG;
 		pthread_mutex_unlock(&cs.lock);
 		int pct = bytes * 100 / phys_size;
@@ -1656,11 +1749,13 @@ static void *stat_thread(void *arg)
 		fchmod(fileno(f), 0600); /* how many pages share a copy says something about what they hold */
 		if (cratio)
 			fprintf(f, "COMPRESSED=1\nPAGES=%llu\nSTORED_BYTES=%llu\nSEGMENT_BYTES=%llu\nREFUSED=%llu\n"
-				   "SPILLED_BYTES=%llu\nSPILL_BYTES=%llu\nRECORDS=%llu\nWAITS=%llu\n",
+				   "SPILLED_BYTES=%llu\nSPILL_BYTES=%llu\nRECORDS=%llu\nWAITS=%llu\n"
+				   "REREAD=%llu\nMENDED=%llu\nUNREADABLE=%llu\n",
 				(unsigned long long)pages, (unsigned long long)bytes, (unsigned long long)held,
 				(unsigned long long)refused, (unsigned long long)sbytes,
 				(unsigned long long)spill_size, (unsigned long long)recs,
-				(unsigned long long)waits);
+				(unsigned long long)waits, (unsigned long long)reread,
+				(unsigned long long)mended, (unsigned long long)lost);
 		fprintf(f, "VRAM_BYTES=%llu\nCIPHER=%s\nUPTIME=%llu\nSAMPLE=%d\n", (unsigned long long)phys_size,
 			cratio ? cipher_name : "none", (unsigned long long)((now_ns() - started) / 1000000000),
 			SAMPLE);
@@ -2732,14 +2827,39 @@ static void selftest_compress(int threads)
 		pattern(ta, b, tver[b]);
 		if (vram_rw(0, E_OFF(e) + REC_HDR, tb, BLK) || !memcmp(ta, tb, BLK))
 			die("selftest: page %llu is stored unencrypted", (unsigned long long)b);
-		was = tb[100], tb[100] ^= 1;
-		if (vram_rw(1, E_OFF(e) + REC_HDR + 100, tb + 100, 1) ||
-		    nbd_io(fd, NBD_CMD_READ, b * BLK, tb, BLK) != EIO)
+		/* One bit flipped, in the data, the tag or the nonce: found, put right on the card, and counted. */
+		static const unsigned spots[] = { REC_HDR + 100, 20, 15, REC_HDR + BLK - 1, 5 };
+		double worst = 0;
+		for (unsigned k = 0; k < sizeof spots / sizeof *spots; k++) {
+			uint64_t at = E_OFF(e) + spots[k], before = cs.mended;
+			char flipped;
+			if (vram_rw(0, at, &was, 1))
+				die("selftest: could not read the card");
+			flipped = was ^ (1 << (k + 2));
+			t = now();
+			if (vram_rw(1, at, &flipped, 1) || nbd_io(fd, NBD_CMD_READ, b * BLK, tb, BLK) ||
+			    memcmp(ta, tb, BLK))
+				die("selftest: a flipped bit at byte %u of a record was not put right", spots[k]);
+			if (now() - t > worst)
+				worst = now() - t;
+			if (vram_rw(0, at, &flipped, 1) || flipped != was || cs.mended != before + 1)
+				die("selftest: a flipped bit was read past but not mended on the card");
+		}
+		/* Two bits is more than can be put right: that must be an error, never wrong data. */
+		char two[2], twas[2];
+		uint64_t lost = cs.lost;
+		if (vram_rw(0, E_OFF(e) + REC_HDR + 100, twas, 2))
+			die("selftest: could not read the card");
+		two[0] = twas[0] ^ 1, two[1] = twas[1] ^ 0x80;
+		if (vram_rw(1, E_OFF(e) + REC_HDR + 100, two, 2) ||
+		    nbd_io(fd, NBD_CMD_READ, b * BLK, tb, BLK) != EIO || cs.lost != lost + 1)
 			die("selftest: an altered page was not refused");
-		if (vram_rw(1, E_OFF(e) + REC_HDR + 100, &was, 1))
+		if (vram_rw(1, E_OFF(e) + REC_HDR + 100, twas, 2))
 			die("selftest: could not restore the page");
 		check_pages(fd, b, 1, "after restoring an altered page");
 		printf("encryption            ok (%s; an altered page is refused)\n", cipher_name);
+		printf("repair                ok (one flipped bit is found and put right, in %.0f ms at worst)\n",
+		       worst * 1000);
 		break;
 	}
 
@@ -2773,7 +2893,7 @@ static void selftest_compress(int threads)
 		uint16_t len, wrong;
 		if (!e || E_OFF(e) >= phys_size || cs.state[v] != SEG_CLOSED || cs.rref[cs.map[b]] != 1)
 			continue;
-		len = E_LEN(e), wrong = len ^ 0x40;
+		len = E_LEN(e), wrong = len ^ 0x41; /* two bits: one would simply be put right */
 		pthread_mutex_lock(&cs.lock);
 		if (vram_rw(1, E_OFF(e) + 4, (char *)&wrong, 2) || vram_rw(0, (uint64_t)v * SEG, cs.gcbuf, cs.used[v]))
 			die("selftest: could not damage a record");
@@ -2853,6 +2973,19 @@ static void selftest_compress(int threads)
 			    !memcmp(ta, tb + (fo & (BLK - 1)) + REC_HDR, BLK))
 				die("selftest: page %llu is in the spill file unencrypted", (unsigned long long)c);
 			printf("spill file            holds no plain page\n");
+			{ /* a bit flipped on the disk is put right there too */
+				uint64_t blk = spill_base + (fo & ~(uint64_t)(BLK - 1)), before = cs.mended;
+				size_t at = (fo & (BLK - 1)) + REC_HDR + 9;
+				char good = tb[at];
+				tb[at] ^= 0x10;
+				if (pwrite(spill_fd, tb, 3 * BLK, blk) != 3 * BLK ||
+				    nbd_io(fd, NBD_CMD_READ, c * BLK, tb, BLK) || memcmp(ta, tb, BLK) ||
+				    cs.mended != before + 1)
+					die("selftest: a flipped bit in the spill file was not put right");
+				if (cs.rloc[cs.map[c]] == e && (pread(spill_fd, tb, 3 * BLK, blk) != 3 * BLK || tb[at] != good))
+					die("selftest: a flipped bit in the spill file was read past but not mended");
+				printf("spill file            a flipped bit is found and put right\n");
+			}
 			if (!err) { /* the same page written elsewhere must find its copy in the file */
 				uint64_t d = c ? c - 1 : c + 1;
 				char *keep = malloc(BLK);

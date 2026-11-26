@@ -274,10 +274,15 @@ swap: `swapoff /swap.img && swapon /swap.img`.
   GPU out of its lowest power states for as long as it runs. On a desktop
   that is a few watts; on a laptop with a GPU that would otherwise power
   down it costs battery, and vroom is probably the wrong tool there.
-- **Consumer cards have no ECC.** A compressed device notices a flipped bit
-  (the page fails its check and the read is an I/O error, not wrong data).
-  A plain device does not: it returns whatever the card holds, as a RAM
-  disk on non-ECC memory would.
+- **Consumer cards have no ECC.** A compressed device makes up for some of
+  that. A stored page that fails its check is read again, and if it is
+  still wrong, tried with each of its bits turned over until the check
+  passes: one flipped bit, on the card or in the spill, is found and put
+  right where it lies, in a few tens of milliseconds. More damage than that
+  is an I/O error, never wrong data. `vroomctl stats` counts both. None of
+  this helps a page that was already wrong in the machine's own memory
+  before it was written, and a plain device has no check at all: it returns
+  whatever the card holds, as a RAM disk on non-ECC memory would.
 - **A plain device holds pages as they are.** Anyone who can read the
   card's memory can read them. They are wiped when the device is stopped
   cleanly; use `--compress` if that is not enough, which also encrypts.
@@ -314,6 +319,7 @@ runs its self-tests under the address and undefined-behaviour sanitizers.
 It needs no GPU and no root, and is what CI runs. It covers the storage
 engine: integrity through rewrites, cleaning, spilling and coming back,
 several writers at once, discards, a damaged record, an altered page, a
+flipped bit on the card and on the disk, a
 failing spill disk, and a check after each stage that the store's tables
 agree with each other. `vroomctl selftest` runs the same tests on a real
 card. Neither covers the kernel side (the ublk queue, attaching, signals,

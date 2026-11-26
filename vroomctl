@@ -370,6 +370,12 @@ stats)
 					printf "  %-12s %s writes have had to wait for room on the card\n", "housekeeping", (v["WAITS"] > 0 ? count(v["WAITS"]) : "no")
 				if (v["REFUSED"] > 0)
 					printf "  %-12s %d WRITES, because the store was full\n", "REFUSED", v["REFUSED"]
+				if ("MENDED" in v) {
+					if (v["MENDED"] + v["REREAD"] + v["UNREADABLE"] == 0)
+						printf "  %-12s no stored page has failed its check\n", "integrity"
+					else
+						printf "  %-12s %d pages had a flipped bit put right, %d read right at the second try, %d UNREADABLE\n", "integrity", v["MENDED"], v["REREAD"], v["UNREADABLE"]
+				}
 			}
 			if (v["CIPHER"] == "aes") c = "AES-256-GCM, key only in the daemon'\''s memory"
 			else if (v["CIPHER"] == "chacha20") c = "ChaCha20-Poly1305, key only in the daemon'\''s memory"
