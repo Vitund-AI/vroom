@@ -1067,7 +1067,8 @@ static int cs_read(uint64_t off, char *buf, size_t len)
 			else
 				cs.hits[g] = 1;
 			cs.lastoff[g] = end - (uint64_t)g * SEG;
-			if (cs.hits[g] >= 3 && !load && spare) {
+			/* a read that already takes in a good stretch gains nothing from more */
+			if (cs.hits[g] >= 3 && !load && spare && end - start <= 65536) {
 				load = spare;
 				*load = (struct held){ .seg = g, .seq = cs.seq[g], .loading = 1, .buf = spare->buf };
 				load_from = in_seg, load_to = in, load_len = end - start;
