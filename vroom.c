@@ -38,6 +38,7 @@
 #include <sys/prctl.h>
 #include <poll.h>
 #include <sys/random.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -2342,6 +2343,15 @@ int main(int argc, char **argv)
 		size_mib = 1024;
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
+	/*
+	 * Our memory holds other programs' pages and the keys. It is locked, so
+	 * it is never swapped; this makes sure it is never written to a core
+	 * file either, and that only root can look at it through /proc. Nothing
+	 * keeps root out, who can read the device itself anyway.
+	 */
+	struct rlimit none = { 0, 0 };
+	if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) || setrlimit(RLIMIT_CORE, &none))
+		fprintf(stderr, "vroom: warning: cannot rule out core dumps: %s\n", strerror(errno));
 	if (dev_path && !do_bench) { /* figures left by an earlier daemon are not ours */
 		char path[128];
 		const char *base = strrchr(dev_path, '/');

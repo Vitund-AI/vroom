@@ -21,6 +21,8 @@ TimeoutStopSec=15min
 Restart=no
 
 OOMScoreAdjust=-1000
+# The daemon rules out core dumps itself; this is the same from outside.
+LimitCORE=0
 LimitMEMLOCK=infinity
 
 [Install]
