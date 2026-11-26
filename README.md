@@ -176,6 +176,10 @@ so stay conservative: `--ratio` defaults to 1.5. It is not offered for
 `--mount`, where a refused write would corrupt the filesystem.
 
 `--spill PATH` removes the catch by adding a file on disk as a second tier.
+PATH can also be a whole empty disk or partition, such as `/dev/nvme1n1`,
+which is then used directly, with no filesystem in between; it has to look
+empty (no partitions, no filesystem) and not be in use, and everything on
+it is overwritten.
 When the card passes 90% full, the oldest pages move to the file; when it
 falls below 70% they come back. With the file as large as the device, which
 is the default, writes are never refused. Pages in the file are read at the

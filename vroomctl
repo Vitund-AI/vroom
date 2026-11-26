@@ -17,7 +17,8 @@
 #   --gpu N         CUDA index of the GPU (0)
 #   --compress      compress pages; the device is RATIO times the VRAM (swap and raw only)
 #   --ratio X       how much larger (1.5; 2.2 with --spill)
-#   --spill PATH    file or directory on a disk for what does not fit in the VRAM
+#   --spill PATH    what does not fit in the VRAM goes here: a file, a directory to
+#                   put one in, or a whole empty disk or partition such as /dev/sdb
 #   --spill-size MiB   size of that file (default: the size of the device)
 #   --cipher aes|chacha20   what a compressed device is encrypted with (aes)
 #   --boot          also start at every boot
@@ -161,6 +162,15 @@ add)
 			[[ $spill == /* && $spill != *[[:space:]]* ]] || die "--spill needs an absolute path without spaces"
 			[ -d "$spill" ] && spill=${spill%/}/vroom-$name.spill
 			[ -d "$(dirname "$spill")" ] || die "--spill: no directory $(dirname "$spill")"
+			if [ -b "$spill" ]; then
+				# Everything on it will be overwritten, so it has to look empty first.
+				[ "$(lsblk -nro NAME "$spill" | wc -l)" = 1 ] ||
+					die "--spill $spill has partitions on it; give one of them, or clear the disk with: wipefs -a $spill"
+				sig=$(blkid -p -o value -s TYPE "$spill" 2>/dev/null || true)
+				[ -z "$sig" ] ||
+					die "--spill $spill has a $sig filesystem on it; if that is to go: wipefs -a $spill"
+				grep -qs "^$spill[[:space:]]" /proc/swaps /proc/mounts && die "--spill $spill is in use"
+			fi
 		fi
 	else
 		ratio=0
@@ -423,7 +433,7 @@ _detach) # ExecStop: must succeed before the daemon is asked to exit
 	detach
 	;;
 *)
-	sed -n '2,25p' "$0" >&2
+	sed -n '2,26p' "$0" >&2
 	exit 1
 	;;
 esac

@@ -371,7 +371,7 @@ static struct {
 	 .room = PTHREAD_COND_INITIALIZER };
 
 static const char *spill_path;
-static int spill_fd = -1;
+static int spill_fd = -1, spill_is_dev;
 static uint64_t spill_size;
 static int high_pct = 90, low_pct = 70;
 static void *keeper_thread(void *arg);
@@ -469,18 +469,42 @@ static void cs_init(void)
 
 	cs.nseg = phys_size / SEG;
 	if (spill_path) {
-		/* O_DIRECT: nothing of ours should sit in the page cache while memory is short. */
-		spill_fd = open(spill_path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC | O_DIRECT, 0600);
-		if (spill_fd < 0 && errno == EINVAL)
-			spill_fd = open(spill_path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-		if (spill_fd < 0)
-			die("--spill %s: %s", spill_path, strerror(errno));
-		if (!spill_size)
-			spill_size = dev_size;
-		int r = posix_fallocate(spill_fd, 0, spill_size);
-		if (r)
-			die("--spill %s: cannot reserve %llu MiB: %s", spill_path,
-			    (unsigned long long)(spill_size / MiB), strerror(r));
+		/*
+		 * The spill can be a file, which is made here and removed at the end,
+		 * or a whole disk or partition, which is simply used: everything on
+		 * it is overwritten. O_EXCL makes the kernel refuse one that is
+		 * mounted, or has a partition mounted, or is otherwise in use.
+		 * O_DIRECT: nothing of ours should sit in the page cache while memory
+		 * is short.
+		 */
+		struct stat st;
+		spill_is_dev = !stat(spill_path, &st) && S_ISBLK(st.st_mode);
+		if (spill_is_dev) {
+			uint64_t whole = 0, range[2] = { 0, 0 };
+			spill_fd = open(spill_path, O_RDWR | O_CLOEXEC | O_DIRECT | O_EXCL);
+			if (spill_fd < 0)
+				die("--spill %s: %s%s", spill_path, strerror(errno),
+				    errno == EBUSY ? " (it, or a partition on it, is in use)" : "");
+			if (ioctl(spill_fd, BLKGETSIZE64, &whole) || whole < 16 * MiB)
+				die("--spill %s: cannot tell its size", spill_path);
+			if (!spill_size || spill_size > whole)
+				spill_size = dev_size < whole ? dev_size : whole;
+			spill_size &= ~(uint64_t)(SEG - 1);
+			range[1] = spill_size; /* tell an SSD that all of this is free to start with */
+			ioctl(spill_fd, BLKDISCARD, range);
+		} else {
+			spill_fd = open(spill_path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC | O_DIRECT, 0600);
+			if (spill_fd < 0 && errno == EINVAL)
+				spill_fd = open(spill_path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+			if (spill_fd < 0)
+				die("--spill %s: %s", spill_path, strerror(errno));
+			if (!spill_size)
+				spill_size = dev_size;
+			int r = posix_fallocate(spill_fd, 0, spill_size);
+			if (r)
+				die("--spill %s: cannot reserve %llu MiB: %s", spill_path,
+				    (unsigned long long)(spill_size / MiB), strerror(r));
+		}
 		cs.nspill = spill_size / SEG;
 		fprintf(stderr, "vroom: spilling to %s (%llu MiB) above %d%% full, back below %d%%\n",
 			spill_path, (unsigned long long)(spill_size / MiB), high_pct, low_pct);
@@ -2620,7 +2644,7 @@ int main(int argc, char **argv)
 		serve_ublk(threads);
 	else
 		serve_nbd(threads);
-	if (spill_path)
+	if (spill_path && !spill_is_dev)
 		unlink(spill_path);
 	if (test) {
 		static const char *what[P_KINDS] = { "requests read", "requests write", "VRAM read", "VRAM write",
