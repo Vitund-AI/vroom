@@ -1970,6 +1970,14 @@ int main(int argc, char **argv)
 		size_mib = 1024;
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
+	if (dev_path && !do_bench) { /* figures left by an earlier daemon are not ours */
+		char path[128];
+		const char *base = strrchr(dev_path, '/');
+		snprintf(path, sizeof path, "/run/vroom/%s.stat", base ? base + 1 : dev_path);
+		unlink(path);
+		snprintf(path, sizeof path, "/run/vroom/%s.count", base ? base + 1 : dev_path);
+		unlink(path);
+	}
 	if (do_bench) {
 		bench(threads);
 		return 0;
