@@ -167,11 +167,27 @@ static void vram_init(int gpu, uint64_t size_mib)
  * quickest copy, so even that much is caution. Everything is counted.
  */
 #define SAMPLE 16
-enum { P_VRAM_READ, P_VRAM_WRITE, P_DISK_READ, P_DISK_WRITE, P_KINDS };
+#define HIST 112 /* buckets a quarter of a doubling wide, from 64 ns to 4 minutes */
+enum { P_REQ_READ, P_REQ_WRITE, P_VRAM_READ, P_VRAM_WRITE, P_DISK_READ, P_DISK_WRITE, P_KINDS };
 static struct perf {
 	uint64_t ops, bytes;		 /* all of them */
 	uint64_t t_ops, t_bytes, t_ns;	 /* the ones that were timed */
+	uint64_t hist[HIST];		 /* how long those took */
 } perf[P_KINDS];
+
+static unsigned hist_bucket(uint64_t ns)
+{
+	if (ns < 64)
+		return 0;
+	unsigned b = 63 - __builtin_clzll(ns), i = (b - 6) * 4 + ((ns >> (b - 2)) & 3);
+	return i < HIST ? i : HIST - 1;
+}
+
+/* A time in nanoseconds from the middle of bucket i. */
+static double hist_ns(unsigned i)
+{
+	return (double)((4 | (i & 3)) << (i / 4 + 4)) * 1.09;
+}
 
 static uint64_t now_ns(void)
 {
@@ -191,7 +207,9 @@ static void perf_end(int kind, size_t len, uint64_t t0)
 {
 	if (!t0)
 		return;
-	__atomic_add_fetch(&perf[kind].t_ns, now_ns() - t0, __ATOMIC_RELAXED);
+	uint64_t ns = now_ns() - t0;
+	__atomic_add_fetch(&perf[kind].hist[hist_bucket(ns)], 1, __ATOMIC_RELAXED);
+	__atomic_add_fetch(&perf[kind].t_ns, ns, __ATOMIC_RELAXED);
 	__atomic_add_fetch(&perf[kind].t_bytes, len, __ATOMIC_RELAXED);
 	__atomic_add_fetch(&perf[kind].t_ops, 1, __ATOMIC_RELAXED);
 }
@@ -1164,11 +1182,17 @@ static void count_print(FILE *f)
 /* One read or write of the device, whichever way it is stored. Returns 0 or an errno. */
 static int dev_rw(int wr, uint64_t off, char *buf, size_t len)
 {
+	uint64_t t0 = perf_begin(wr ? P_REQ_WRITE : P_REQ_READ, len);
+	int err;
+
 	if (counting && !(off % BLK))
 		count_io(wr, off, buf, len);
 	if (!cratio)
-		return vram_rw(wr, off, buf, len) ? EIO : 0;
-	return wr ? cs_write(off, buf, len) : cs_read(off, buf, len);
+		err = vram_rw(wr, off, buf, len) ? EIO : 0;
+	else
+		err = wr ? cs_write(off, buf, len) : cs_read(off, buf, len);
+	perf_end(wr ? P_REQ_WRITE : P_REQ_READ, len, t0);
+	return err;
 }
 
 static const char *dev_path;
@@ -1195,28 +1219,51 @@ static void *count_thread(void *arg)
 }
 
 /* While serving: keep /run/vroom/DEVICE.stat current for 'vroomctl list', and warn when nearly full. */
+/* The time below which the fraction q of the timed operations between two readings finished. */
+static double hist_quantile(const struct perf *now, const struct perf *then, double q)
+{
+	uint64_t n = now->t_ops - then->t_ops, seen = 0;
+	if (!n)
+		return 0;
+	for (unsigned i = 0; i < HIST; i++) {
+		seen += now->hist[i] - then->hist[i];
+		if (seen >= q * n)
+			return hist_ns(i);
+	}
+	return hist_ns(HIST - 1);
+}
+
+/*
+ * While serving: every two seconds write /run/vroom/DEVICE.stat for vroomctl,
+ * and warn when the store is nearly full. Readings are kept for five minutes
+ * so that rates and latencies can be given for the last minute and the last
+ * five; the peak is the busiest two seconds since the start.
+ */
+#define TICK 2
+#define KEPT (300 / TICK + 1)
 static void *stat_thread(void *arg)
 {
-	static const char *kind[P_KINDS] = { "VRAM_READ", "VRAM_WRITE", "DISK_READ", "DISK_WRITE" };
+	static const char *kind[P_KINDS] = { "req_read", "req_write", "vram_read", "vram_write",
+					     "disk_read", "disk_write" };
+	static const int window[2] = { 60, 300 };
+	static struct perf ring[KEPT][P_KINDS];
 	char path[128], tmp[136];
 	const char *base = strrchr(dev_path, '/');
-	uint64_t last = ~0ULL;
-	struct perf was[P_KINDS] = { 0 };
-	double us[P_KINDS] = { 0 }, mibs[P_KINDS] = { 0 }, kib[P_KINDS] = { 0 };
+	double peak[P_KINDS] = { 0 };
+	uint64_t started = now_ns();
 	int warned = 0;
 
 	(void)arg;
 	mkdir("/run/vroom", 0755);
 	snprintf(path, sizeof path, "/run/vroom/%s.stat", base ? base + 1 : dev_path);
 	snprintf(tmp, sizeof tmp, "%s.tmp", path);
-	for (;; sleep(2)) {
+	for (unsigned tick = 0;; tick++, sleep(TICK)) {
 		pthread_mutex_lock(&cs.lock);
 		uint64_t pages = cs.pages, bytes = cs.bytes - cs.sbytes, refused = cs.refused, sbytes = cs.sbytes;
 		uint64_t recs = cs.recs;
 		uint64_t held = (uint64_t)(cs.nseg - cs.nfree) * SEG;
 		pthread_mutex_unlock(&cs.lock);
 		int pct = bytes * 100 / phys_size;
-		uint64_t sum = pages + bytes + refused + sbytes * 3;
 
 		if (spill_fd >= 0)
 			pct = spill_size ? sbytes * 100 / spill_size : 0;
@@ -1225,21 +1272,15 @@ static void *stat_thread(void *arg)
 					"writes will fail when it is full\n",
 				spill_fd >= 0 ? "spill file" : "VRAM", pct);
 		warned = pct >= 90 ? 1 : pct < 80 ? 0 : warned;
-		/* speeds over the copies timed since last time; with none, the last known stand */
-		for (int k = 0; k < P_KINDS; k++) {
-			struct perf p = perf[k];
-			uint64_t n = p.t_ops - was[k].t_ops, ns = p.t_ns - was[k].t_ns;
-			if (n && ns) {
-				us[k] = ns / 1e3 / n;
-				mibs[k] = (p.t_bytes - was[k].t_bytes) / (double)MiB / (ns / 1e9);
-				kib[k] = (p.t_bytes - was[k].t_bytes) / 1024.0 / n;
+
+		struct perf *cur = ring[tick % KEPT];
+		memcpy(cur, perf, sizeof perf);
+		if (tick)
+			for (int k = 0; k < P_KINDS; k++) {
+				double r = (cur[k].bytes - ring[(tick - 1) % KEPT][k].bytes) / (double)TICK;
+				if (r > peak[k])
+					peak[k] = r;
 			}
-			was[k] = p;
-			sum += p.ops * (k + 5);
-		}
-		if (sum == last)
-			continue;
-		last = sum;
 		FILE *f = fopen(tmp, "w");
 		if (!f)
 			continue;
@@ -1249,12 +1290,29 @@ static void *stat_thread(void *arg)
 				(unsigned long long)pages, (unsigned long long)bytes, (unsigned long long)held,
 				(unsigned long long)refused, (unsigned long long)sbytes,
 				(unsigned long long)spill_size, (unsigned long long)recs);
-		fprintf(f, "VRAM_BYTES=%llu\nCIPHER=%s\n", (unsigned long long)phys_size,
-			cratio ? cipher_name : "none");
-		for (int k = 0; k < P_KINDS; k++)
-			fprintf(f, "%s_OPS=%llu\n%s_MIB=%llu\n%s_US=%.1f\n%s_MIBS=%.0f\n%s_KIB=%.0f\n", kind[k],
-				(unsigned long long)was[k].ops, kind[k], (unsigned long long)(was[k].bytes / MiB),
-				kind[k], us[k], kind[k], mibs[k], kind[k], kib[k]);
+		fprintf(f, "VRAM_BYTES=%llu\nCIPHER=%s\nUPTIME=%llu\nSAMPLE=%d\n", (unsigned long long)phys_size,
+			cratio ? cipher_name : "none", (unsigned long long)((now_ns() - started) / 1000000000),
+			SAMPLE);
+		/*
+		 * One line for each kind of operation:
+		 * #perf KIND total-ops total-bytes peak-bytes/s, then for each window
+		 * its length in seconds, ops/s, bytes/s and the p50, p95 and p99 time in ns.
+		 */
+		for (int k = 0; k < P_KINDS; k++) {
+			fprintf(f, "#perf %s %llu %llu %.0f", kind[k], (unsigned long long)cur[k].ops,
+				(unsigned long long)cur[k].bytes, peak[k]);
+			for (int w = 0; w < 2; w++) {
+				unsigned back = (unsigned)window[w] / TICK < tick ? (unsigned)window[w] / TICK : tick;
+				struct perf *old = &ring[(tick - back) % KEPT][k];
+				double secs = back * TICK;
+				fprintf(f, " %.0f %.1f %.0f %.0f %.0f %.0f", secs,
+					secs ? (cur[k].ops - old->ops) / secs : 0,
+					secs ? (cur[k].bytes - old->bytes) / secs : 0,
+					hist_quantile(&cur[k], old, 0.50), hist_quantile(&cur[k], old, 0.95),
+					hist_quantile(&cur[k], old, 0.99));
+			}
+			fputc('\n', f);
+		}
 		fclose(f);
 		rename(tmp, path);
 	}
@@ -2389,13 +2447,17 @@ int main(int argc, char **argv)
 	if (spill_path)
 		unlink(spill_path);
 	if (test) {
-		static const char *what[P_KINDS] = { "VRAM read", "VRAM write", "disk read", "disk write" };
+		static const char *what[P_KINDS] = { "requests read", "requests write", "VRAM read", "VRAM write",
+						     "disk read", "disk write" };
+		static const struct perf none;
+		printf("\ntimed 1 in %d      operations   avg size       p50       p95       p99\n", SAMPLE);
 		for (int k = 0; k < P_KINDS; k++)
 			if (perf[k].t_ops)
-				printf("%-10s %9.1f us a copy of %.0f KiB on average, %6.0f MiB/s  (%llu copies, 1 in %d timed)\n",
-				       what[k], perf[k].t_ns / 1e3 / perf[k].t_ops, perf[k].t_bytes / 1024.0 / perf[k].t_ops,
-				       perf[k].t_bytes / (double)MiB / (perf[k].t_ns / 1e9),
-				       (unsigned long long)perf[k].ops, SAMPLE);
+				printf("%-15s %12llu %8.0f KiB %7.1f us %7.1f us %7.1f us\n", what[k],
+				       (unsigned long long)perf[k].ops, perf[k].bytes / 1024.0 / perf[k].ops,
+				       hist_quantile(&perf[k], &none, 0.50) / 1e3,
+				       hist_quantile(&perf[k], &none, 0.95) / 1e3,
+				       hist_quantile(&perf[k], &none, 0.99) / 1e3);
 	}
 	if (counting && test)
 		count_print(stdout);

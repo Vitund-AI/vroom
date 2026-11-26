@@ -217,9 +217,12 @@ and `stop` refuse, and change nothing, if the device is busy. Each device is
 the systemd unit `vroom@NAME` (logs: `journalctl -u vroom@NAME`), defined by
 `/etc/vroom/NAME.conf`. `sudo vroomctl bench NAME` runs a read-only latency
 test that is safe on a live device. `vroomctl stats [NAME]` shows what a device
-has read and written, how fast copies to and from the card and the spill
-file are currently going (the daemon times one in sixteen) and, where they
-are switched on, its compression and repeat counts; `watch -n 2 vroomctl stats` keeps it on screen.
+holds and a table of what it has done: totals and the busiest two seconds
+since it started, and for the last minute and the last five the rate and the
+median, 95th and 99th percentile time, each for whole requests, for copies
+to and from the card and for the spill file. The daemon times one operation
+in sixteen. Compression, sharing, encryption and repeat counts are shown
+where they apply; `watch -n 2 vroomctl stats` keeps it on screen.
 
 To move pages that are already in disk swap over to the VRAM, cycle the disk
 swap: `swapoff /swap.img && swapon /swap.img`.

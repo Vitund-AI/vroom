@@ -271,43 +271,88 @@ stats)
 	for f in "$CONF_DIR"/${1:-*}.conf; do
 		[ -e "$f" ] || die "no such device: ${1:-} (see 'vroomctl list')"
 		load "$(basename "$f" .conf)"
-		[ -r "/sys/block/$kname/stat" ] || { echo "$name: not running"; continue; }
-		echo "$name ($DEV)"
-		# /sys/block/DEV/stat: reads, -, sectors read, ms, writes, -, sectors written, ms, ...
-		awk '{ printf "  read     %10.0f MiB in %d requests\n  written  %10.0f MiB in %d requests\n",
-			$3 / 2048, $1, $7 / 2048, $5 }' "/sys/block/$kname/stat"
-		if is_swap; then
-			awk -v d="$DEV" '$1 == d { printf "  swap     %10.0f MiB used of %.0f\n", $4 / 1024, $3 / 1024 }' /proc/swaps
-		fi
-		case "$(sed -n 's/^CIPHER=//p' "/run/vroom/$kname.stat" 2>/dev/null)" in
-		none) echo "  encryption     none: pages are on the card as they are" ;;
-		aes) echo "  encryption     AES-256-GCM, key held only in the daemon's memory" ;;
-		chacha20) echo "  encryption     ChaCha20-Poly1305, key held only in the daemon's memory" ;;
-		esac
-		if grep -qs '^COMPRESSED=1' "/run/vroom/$kname.stat"; then
-			(. "/run/vroom/$kname.stat"; awk -v p="$PAGES" -v b="$STORED_BYTES" -v v="$VRAM_BYTES" \
-				-v s="$SPILLED_BYTES" -v r="$REFUSED" -v n="${RECORDS:-0}" 'BEGIN { m = 1048576
-				printf "  holding  %10.0f MiB of pages in %.0f MiB of VRAM", p * 4096 / m, b / m
-				if (s) printf " and %.0f MiB on disk", s / m
-				if (b + s >= m) printf " (%.2fx)", p * 4096 / (b + s)
-				printf "\n  VRAM     %9d%% full\n", b * 100 / v
-				if (p && n) printf "  sharing  %9.1f%% of pages are a second copy of another\n", (p - n) * 100 / p
-				if (r) printf "  REFUSED  %10d writes: the store was full\n", r }')
-		fi
-		if grep -qs '^VRAM_READ_OPS=' "/run/vroom/$kname.stat"; then
-			# the daemon times one copy in 16; these are the latest it has
-			(. "/run/vroom/$kname.stat"; awk \
-				-v a="$VRAM_READ_OPS $VRAM_READ_US $VRAM_READ_KIB $VRAM_READ_MIBS $VRAM_WRITE_OPS $VRAM_WRITE_US $VRAM_WRITE_KIB $VRAM_WRITE_MIBS" \
-				-v d="$DISK_READ_OPS $DISK_READ_US $DISK_READ_KIB $DISK_READ_MIBS $DISK_WRITE_OPS $DISK_WRITE_US $DISK_WRITE_KIB $DISK_WRITE_MIBS" '
-				function one(dir, n, us, kib, mibs) {
-					if (!n) return
-					printf "    %-5s %8.1f us a copy of %d KiB on average, %d MiB/s\n", dir, us, kib, mibs }
-				function both(what, s,   f) { split(s, f, " ")
-					if (!(f[1] + f[5])) return
-					print "  " what ", latest speeds"
-					one("read", f[1], f[2], f[3], f[4]); one("write", f[5], f[6], f[7], f[8]) }
-				BEGIN { both("VRAM", a); both("spill file", d) }')
-		fi
+		[ -r "/sys/block/$kname/size" ] || { echo "$name: not running"; continue; }
+		swapkb=$(awk -v d="$DEV" '$1 == d { print $4 }' /proc/swaps)
+		mnt=''
+		if [ "$VROOM_MODE" = mount ] && is_mounted; then mnt=$VROOM_MOUNT; fi
+		# Sizes, rates and times are printed in whatever unit suits the number.
+		awk -v name="$name" -v dev="$DEV" -v sectors="$(cat "/sys/block/$kname/size")" \
+			-v swapkb="${swapkb:--1}" -v mnt="$mnt" '
+		function size(b) {
+			if (b < 1024) return sprintf("%d B", b)
+			if (b < 1048576) return sprintf("%.3g KiB", b / 1024)
+			if (b < 1073741824) return sprintf("%.3g MiB", b / 1048576)
+			return sprintf("%.3g GiB", b / 1073741824)
+		}
+		function rate(b) { return b < 1 ? "-" : size(b) "/s" }
+		function count(n) {
+			if (n < 10000) return sprintf("%d", n)
+			if (n < 1e7) return sprintf("%.3g k", n / 1e3)
+			if (n < 1e10) return sprintf("%.3g M", n / 1e6)
+			return sprintf("%.3g G", n / 1e9)
+		}
+		function took(ns) {
+			if (ns < 1) return "-"
+			if (ns < 1e6) return sprintf("%.3g us", ns / 1e3)
+			if (ns < 1e9) return sprintf("%.3g ms", ns / 1e6)
+			return sprintf("%.3g s", ns / 1e9)
+		}
+		function up(s) {
+			if (s < 120) return s " s"
+			if (s < 7200) return int(s / 60) " min"
+			if (s < 172800) return int(s / 3600) " h " int(s % 3600 / 60) " min"
+			return int(s / 86400) " days " int(s % 86400 / 3600) " h"
+		}
+		function row(what, dir, k,   f, w, o) {
+			if (!(k in perf)) return 0
+			split(perf[k], f, " ")
+			if (!f[2]) return 0
+			printf "  %-9s %-5s %10s %8s %11s", what, dir, size(f[3]), count(f[2]), rate(f[4])
+			for (w = 0; w < 2; w++) {
+				o = 5 + w * 6
+				printf "   %11s %8s %8s %8s", rate(f[o + 2]), took(f[o + 3]), took(f[o + 4]), took(f[o + 5])
+			}
+			print ""
+			return 1
+		}
+		/^#perf / { perf[$2] = $0; sub(/^#perf /, "", perf[$2]); next }
+		/=/ { split($0, kv, "="); v[kv[1]] = kv[2] }
+		END {
+			printf "%s   %s", name, dev
+			if ("UPTIME" in v) printf "   up %s", up(v["UPTIME"])
+			print ""
+			printf "  %-12s %s offered", "size", size(sectors * 512)
+			if ("VRAM_BYTES" in v) printf ", on %s of VRAM", size(v["VRAM_BYTES"])
+			if (v["SPILL_BYTES"] > 0) printf " and a %s spill file", size(v["SPILL_BYTES"])
+			print ""
+			if (swapkb >= 0) printf "  %-12s %s as swap\n", "in use", size(swapkb * 1024)
+			if (mnt != "") printf "  %-12s mounted at %s\n", "in use", mnt
+			if (v["COMPRESSED"]) {
+				b = v["STORED_BYTES"]; s = v["SPILLED_BYTES"]; p = v["PAGES"]
+				printf "  %-12s %s of pages in %s of VRAM", "holding", size(p * 4096), size(b)
+				if (s > 0) printf " and %s on disk", size(s)
+				if (b + s >= 1048576) printf "  (%.2fx)", p * 4096 / (b + s)
+				printf "\n  %-12s %d%% full\n", "VRAM", b * 100 / v["VRAM_BYTES"]
+				if (p > 0 && v["RECORDS"] > 0)
+					printf "  %-12s %.1f%% of pages are a copy of another\n", "sharing", (p - v["RECORDS"]) * 100 / p
+				if (v["REFUSED"] > 0)
+					printf "  %-12s %d WRITES, because the store was full\n", "REFUSED", v["REFUSED"]
+			}
+			if (v["CIPHER"] == "aes") c = "AES-256-GCM, key only in the daemon'\''s memory"
+			else if (v["CIPHER"] == "chacha20") c = "ChaCha20-Poly1305, key only in the daemon'\''s memory"
+			else if (v["CIPHER"] == "none") c = "none: pages are on the card as they are"
+			if (c != "") printf "  %-12s %s\n", "encryption", c
+			if (!("req_read" in perf)) exit
+			printf "\n  %-15s %31s   %38s   %38s\n", "", "---------- since start --------", \
+				"------------- last 60 s --------------", "------------- last 5 min -------------"
+			printf "  %-15s %10s %8s %11s   %11s %8s %8s %8s   %11s %8s %8s %8s\n", "", "total", "count", \
+				"peak", "rate", "p50", "p95", "p99", "rate", "p50", "p95", "p99"
+			n = row("requests", "read", "req_read") + row("", "write", "req_write")
+			n += row("VRAM", "read", "vram_read") + row("", "write", "vram_write")
+			n += row("spill", "read", "disk_read") + row("", "write", "disk_write")
+			if (!n) print "  nothing read or written yet"
+			else printf "  times are of 1 operation in %d; the peak is the busiest %d seconds\n", v["SAMPLE"], 2
+		}' "/run/vroom/$kname.stat" 2>/dev/null || echo "$name ($DEV): no figures from its daemon"
 		if [ -r "/run/vroom/$kname.count" ]; then
 			(. "/run/vroom/$kname.count"; awk -v w="$WRITES" -v z="$ZERO" -v sb="$SAME_BLOCK" \
 				-v bo="$BOUNCED" -v du="$DUPLICATE" -v fr="$FRESH" 'BEGIN {
