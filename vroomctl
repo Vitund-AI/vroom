@@ -65,8 +65,8 @@ load() {
 	unit=vroom@$name.service
 }
 
-is_swap() { grep -q "^$DEV[[:space:]]" /proc/swaps; }
-is_mounted() { grep -q "^$DEV[[:space:]]" /proc/mounts; }
+is_swap() { grep -q "^${DEV}[[:space:]]" /proc/swaps; }
+is_mounted() { grep -q "^${DEV}[[:space:]]" /proc/mounts; }
 ready() {
 	# The device must be the one our own daemon has just made, not something
 	# else that happens to have the same name: the next step formats it. The
@@ -183,7 +183,7 @@ add)
 			[ -d "$spill" ] && spill=${spill%/}/vroom-$name.spill
 			[ -d "$(dirname "$spill")" ] || die "--spill: no directory $(dirname "$spill")"
 			if [ -b "$spill" ]; then
-				grep -qs "^$spill[[:space:]]" /proc/swaps /proc/mounts && die "--spill $spill is in use"
+				grep -qs "^${spill}[[:space:]]" /proc/swaps /proc/mounts && die "--spill $spill is in use"
 				spill_disk_ok "$spill"
 				# Remember the disk by a name that stays with it, if it has one.
 				for l in /dev/disk/by-id/*; do
