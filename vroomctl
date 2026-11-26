@@ -208,7 +208,8 @@ list | status)
 		if [ "$state" = active ] && [ -r "/run/vroom/$kname.stat" ]; then
 			use="$use; $(. "/run/vroom/$kname.stat"; awk -v p="$PAGES" -v b="$STORED_BYTES" \
 				-v v="$VRAM_BYTES" -v s="$SPILLED_BYTES" -v r="$REFUSED" 'BEGIN {
-				printf "compressed %.2fx, VRAM %d%% full", b + s ? p * 4096 / (b + s) : 1, b * 100 / v
+				if (b + s < 1048576) printf "compressing, nearly empty"
+				else printf "compressed %.2fx, VRAM %d%% full", p * 4096 / (b + s), b * 100 / v
 				if (s) printf ", %d MiB on disk", s / 1048576
 				if (r) printf ", %d WRITES REFUSED (full)", r }')"
 		fi

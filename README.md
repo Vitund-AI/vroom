@@ -180,9 +180,10 @@ SSD, test data that compresses 1.9x:
 
 Limits to know about: it costs 8 bytes of RAM per page offered (2 MiB per
 GiB); the two water marks are fixed, not learned; and "oldest" is by when a
-page was last written or last moved. So far this is proven by the self-test
-only, which drives the same code as the kernel would but without a block
-device: treat it as experimental until you have run it as swap yourself.
+page was last written or last moved. It has had the self-test and one live
+run as swap (3 GiB of incompressible pages pushed out of a memory-limited
+process, a third of them onto disk, all read back intact), not months of
+daily use: treat it as experimental.
 
 `vroomctl stop NAME` and `start NAME` release and reclaim the VRAM without
 forgetting the definition, e.g. to lend the GPU to something else. `remove`
