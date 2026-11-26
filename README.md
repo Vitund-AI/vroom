@@ -155,8 +155,10 @@ sudo vroomctl add swap --spill /var/lib --ratio 2.2      # 2.2x, overflowing to 
 
 `--compress` runs every page through zstd on its way to the card (using
 `libzstd.so.1`, which systemd already depends on) and offers a device larger
-than the VRAM behind it. A sample of real swap from a desktop compressed
-2.2x. `vroomctl list` shows the ratio being achieved and how full the card is.
+than the VRAM behind it. Pages with identical contents are stored once. A
+sample of real swap from a host running several VMs compressed 2.2x, and one
+page in eight written there was a copy of another. `vroomctl list` shows the
+ratio being achieved and how full the card is.
 
 The catch is that the size is a promise made in advance. If the data does not
 compress that well the card fills up and further writes are refused. For swap
@@ -171,14 +173,15 @@ is the default, writes are never refused. Pages in the file are read at the
 disk's speed, so this is for the cold tail, not a replacement for the card.
 
 `vroomctl selftest --compress 1.5` on an RTX 4090, with test data that
-compresses 2.4x:
+compresses 2.4x and in which one page in eight is a copy of another, so
+that it takes 2.8x less room:
 
 | | Plain | Compressed |
 |---|---|---|
-| Sequential write | 4,100 MiB/s | 620 MiB/s |
-| Sequential read | 3,550 MiB/s | 1,170 MiB/s |
-| 4K random write | 9.5 µs | 14.5 µs |
-| 4K random read | 9.0 µs | 10.9 µs |
+| Sequential write | 4,100 MiB/s | 570 MiB/s |
+| Sequential read | 3,550 MiB/s | 920 MiB/s |
+| 4K random write | 9.5 µs | 14.6 µs |
+| 4K random read | 9.0 µs | 11.3 µs |
 
 With a quarter of the pages on an NVMe SSD, random reads averaged 30 µs.
 
@@ -187,8 +190,9 @@ count, in `/run/vroom/DEVICE.count`, how many pages written were already held
 somewhere on the device. It changes nothing else; it is there to find out
 whether keeping a single copy would be worth building.
 
-Limits to know about: it costs 8 bytes of RAM per page offered (2 MiB per
-GiB); the two water marks are fixed, not learned; and "oldest" is by when a
+Limits to know about: it costs 32 bytes of RAM per page offered (8 MiB per
+GiB); a page is only matched against copies still in VRAM, not ones that
+have moved to the spill file; the two water marks are fixed, not learned; and "oldest" is by when a
 page was last written or last moved. It has had the self-test and one live
 run as swap (3 GiB of incompressible pages pushed out of a memory-limited
 process, a third of them onto disk, all read back intact), not months of
@@ -271,8 +275,6 @@ Ideas, not promises:
 - **Encrypt what is stored**, on the card and in the spill file, with a key
   that exists only in the daemon's memory, so that nothing readable is left
   behind in a spill file, a suspend image or a card handed to a VM.
-- **Keep one copy of identical pages.** `VROOM_COUNT=1` exists to find out
-  how often that would help.
 - **Learn the water marks** for spilling instead of fixing them at 90% and 70%.
 - **Give VRAM back when something else wants it.** Watch how much of the
   card other programs are using and, between a high and a low mark, move

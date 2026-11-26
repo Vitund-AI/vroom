@@ -35,6 +35,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -175,12 +176,15 @@ static int vram_rw(int wr, uint64_t off, char *buf, size_t len)
 /*
  * ---- compressed store (--compress RATIO) ----
  *
- * Each 4K page is compressed by itself and appended, behind an 8-byte header
- * naming it, to a log laid over the VRAM in 1 MiB segments. A table in RAM
- * says where the current copy of every page is. Overwriting or discarding a
- * page only marks the old copy dead; a segment with nothing live in it is
- * free again, and when free segments run short the one with the least live
- * data is read back and its survivors appended afresh.
+ * Each 4K page is compressed by itself into a record and appended, behind an
+ * 8-byte header naming the record, to a log laid over the VRAM in 1 MiB
+ * segments. Tables in RAM say which record each page points at and where
+ * each record is. Pages with identical contents point at the same record: a
+ * page arriving is hashed, and if a record with that hash turns out, read
+ * back, to hold the same bytes, the page just points at it. A record nothing
+ * points at any more is dead; a segment with nothing live in it is free
+ * again, and when free segments run short the one with the least live data
+ * is read back and its survivors appended afresh.
  *
  * Writing a request is one copy to the card however many pages it holds, and
  * pages written together are read back together, as swap tends to do.
@@ -207,10 +211,12 @@ static int vram_rw(int wr, uint64_t off, char *buf, size_t len)
 #define E_VALID (1ULL << 63)
 #define E_OFF(e) ((e) & ((1ULL << 40) - 1))
 #define E_LEN(e) ((uint32_t)((e) >> 40) & 0x1fff)
+#define E_MAKE(off, len) (E_VALID | (uint64_t)(len) << 40 | (off))
+#define IDX_GONE UINT32_MAX
 enum { SEG_FREE, SEG_OPEN, SEG_CLOSED, SEG_CLEANING };
 
 struct rec {
-	uint32_t lpn;
+	uint32_t id; /* which record this is: see cs.rloc */
 	uint16_t len, pad;
 };
 
@@ -223,18 +229,27 @@ static struct {
 } z;
 
 static int clevel = 1;
+static uint64_t hash_secret;
 static struct {
 	pthread_mutex_t lock;
-	uint64_t *map;	    /* per page: 0 reads as zeros, else E_VALID | length << 40 | offset of its record */
-	uint32_t *live;	    /* per segment: bytes of records still current */
-	uint32_t *used;	    /* per segment: bytes appended so far */
+	uint32_t *map;	 /* per page: the record with its contents, or 0 if it reads as zeros */
+	/* Per record. Pages with identical contents share one, so it can move without touching them. */
+	uint64_t *rloc;	 /* where it is: E_MAKE(offset, length); 0 until it has been written */
+	uint64_t *rhash; /* hash of the page it holds */
+	uint32_t *rref;	 /* how many pages point at it; for an unused id, the next unused one */
+	uint32_t rfree, rmax;
+	uint32_t *idx;	 /* open-addressed: hash -> a record holding that page */
+	uint64_t idx_mask, idx_used;
+	/* Per segment */
+	uint32_t *live;	 /* bytes of records still current */
+	uint32_t *used;	 /* bytes appended so far */
 	uint8_t *state;
-	uint64_t *seq;	    /* per segment: when it was opened, for finding the oldest */
+	uint64_t *seq;	 /* when it was opened, for finding the oldest */
 	uint32_t *freelist, nseg, nfree, open;
 	uint32_t *sfree, nspill, nsfree; /* spill segments are numbered nseg onwards */
 	char *gcbuf, *evbuf, *rebuf;
 	uint64_t clock;
-	uint64_t pages, bytes, sbytes; /* pages held, the bytes their records take, and how much of that is spilled */
+	uint64_t pages, recs, bytes, sbytes; /* pages held, the records behind them, their bytes, and how much of that is spilled */
 	uint64_t cleaned, refused, evicted, returned;
 } cs = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
@@ -247,7 +262,7 @@ static void *rehydrate_thread(void *arg);
 /* Per-thread compressor state and page-locked buffer for records on their way in or out. */
 static __thread struct {
 	void *cc, *dc;
-	char *stage;
+	char *stage, *page;
 } ct;
 
 static void ct_init(void)
@@ -259,9 +274,10 @@ static void ct_init(void)
 	if (cu.MemAllocHost(&p, sz) && posix_memalign(&p, BLK, sz))
 		die("cannot allocate staging buffer");
 	ct.stage = p;
+	ct.page = malloc(BLK);
 	ct.cc = z.CreateCCtx();
 	ct.dc = z.CreateDCtx();
-	if (!ct.cc || !ct.dc)
+	if (!ct.cc || !ct.dc || !ct.page)
 		die("cannot create zstd contexts");
 }
 
@@ -275,6 +291,9 @@ static void cs_init(void)
 	z.Compress = sym(lib, "ZSTD_compressCCtx");
 	z.Decompress = sym(lib, "ZSTD_decompressDCtx");
 	z.IsError = sym(lib, "ZSTD_isError");
+	/* Nobody outside should be able to make two pages hash alike on purpose. */
+	if (getrandom(&hash_secret, sizeof hash_secret, 0) != sizeof hash_secret)
+		hash_secret = (uint64_t)time(NULL) * 0x9E3779B97F4A7C15ULL ^ (uintptr_t)&lib;
 
 	cs.nseg = phys_size / SEG;
 	if (spill_path) {
@@ -295,7 +314,17 @@ static void cs_init(void)
 			spill_path, (unsigned long long)(spill_size / MiB), high_pct, low_pct);
 	}
 	uint32_t all = cs.nseg + cs.nspill;
-	cs.map = calloc(dev_size / BLK, sizeof *cs.map);
+	uint64_t npages = dev_size / BLK, cap = 1;
+	/* a request's new records exist briefly alongside the ones they replace */
+	cs.rmax = npages + MAX_PAGES;
+	while (cap < 2ULL * cs.rmax)
+		cap <<= 1;
+	cs.idx_mask = cap - 1;
+	cs.map = calloc(npages, sizeof *cs.map);
+	cs.rloc = calloc(cs.rmax + 1, sizeof *cs.rloc);
+	cs.rhash = calloc(cs.rmax + 1, sizeof *cs.rhash);
+	cs.rref = calloc(cs.rmax + 1, sizeof *cs.rref);
+	cs.idx = calloc(cap, sizeof *cs.idx);
 	cs.live = calloc(all, sizeof *cs.live);
 	cs.used = calloc(all, sizeof *cs.used);
 	cs.seq = calloc(all, sizeof *cs.seq);
@@ -311,9 +340,12 @@ static void cs_init(void)
 	if (cu.MemAllocHost(&p, SEG) && posix_memalign(&p, BLK, SEG))
 		p = NULL;
 	cs.rebuf = p;
-	if (!cs.map || !cs.live || !cs.used || !cs.seq || !cs.state || !cs.freelist || !cs.sfree ||
-	    !cs.gcbuf || !cs.evbuf || !cs.rebuf)
+	if (!cs.map || !cs.rloc || !cs.rhash || !cs.rref || !cs.idx || !cs.live || !cs.used || !cs.seq ||
+	    !cs.state || !cs.freelist || !cs.sfree || !cs.gcbuf || !cs.evbuf || !cs.rebuf)
 		die("out of memory for the compressed store's tables");
+	for (uint32_t id = 1; id <= cs.rmax; id++)
+		cs.rref[id] = id < cs.rmax ? id + 1 : 0;
+	cs.rfree = 1;
 	for (uint32_t s = cs.nseg; s-- > 1;)
 		cs.freelist[cs.nfree++] = s;
 	for (uint32_t s = cs.nspill; s-- > 0;)
@@ -326,6 +358,21 @@ static void cs_init(void)
 	}
 }
 
+static uint64_t page_hash(const char *p)
+{
+	uint64_t h[4] = { 0x9E3779B97F4A7C15ULL ^ hash_secret, 0xBF58476D1CE4E5B9ULL + hash_secret,
+			  0x94D049BB133111EBULL ^ hash_secret >> 7, 0xD6E8FEB86659FD93ULL ^ hash_secret << 9 };
+	for (size_t i = 0; i < BLK; i += 32) {
+		uint64_t w[4];
+		memcpy(w, p + i, 32);
+		for (int k = 0; k < 4; k++)
+			h[k] = (h[k] ^ w[k]) * 0x100000001B3ULL, h[k] ^= h[k] >> 29;
+	}
+	uint64_t x = h[0] ^ h[1] * 3 ^ h[2] * 5 ^ h[3] * 7;
+	x ^= x >> 32, x *= 0xD6E8FEB86659FD93ULL, x ^= x >> 32;
+	return x ? x : 1;
+}
+
 static void seg_free(uint32_t s)
 {
 	cs.state[s] = SEG_FREE;
@@ -336,24 +383,116 @@ static void seg_free(uint32_t s)
 		cs.sfree[cs.nsfree++] = s;
 }
 
-/* Forget the stored copy of a page, if there is one. */
-static void map_drop(uint64_t lpn)
+/* A record's bytes arrive at (add) or leave the place e describes. */
+static void loc_account(uint64_t e, int add)
 {
-	uint64_t e = cs.map[lpn];
-	if (!e)
-		return;
 	uint32_t s = E_OFF(e) / SEG, sz = REC_HDR + E_LEN(e);
-	cs.map[lpn] = 0;
-	cs.pages--;
+	if (add) {
+		cs.bytes += sz;
+		cs.live[s] += sz;
+		if (s >= cs.nseg)
+			cs.sbytes += sz;
+		return;
+	}
 	cs.bytes -= sz;
+	cs.live[s] -= sz;
 	if (s >= cs.nseg)
 		cs.sbytes -= sz;
-	cs.live[s] -= sz;
 	if (!cs.live[s] && cs.state[s] == SEG_CLOSED)
 		seg_free(s);
 }
 
-/* Append records (header, data, header, data...) to the log and point their pages at them. */
+/* A record has been written at e, for the first time or because it was moved. */
+static void rec_place(uint32_t id, uint64_t e)
+{
+	uint64_t old = cs.rloc[id];
+	cs.rloc[id] = e;
+	loc_account(e, 1);
+	if (old)
+		loc_account(old, 0);
+}
+
+static void idx_insert(uint32_t id)
+{
+	if (cs.idx_used * 10 > cs.idx_mask * 7) { /* mostly slots of records long gone: start again */
+		memset(cs.idx, 0, (cs.idx_mask + 1) * sizeof *cs.idx);
+		cs.idx_used = 0;
+		for (uint32_t r = 1; r <= cs.rmax; r++)
+			if (cs.rloc[r] && r != id)
+				idx_insert(r);
+	}
+	uint64_t i = cs.rhash[id] & cs.idx_mask;
+	while (cs.idx[i] && cs.idx[i] != IDX_GONE)
+		i = (i + 1) & cs.idx_mask;
+	cs.idx_used += !cs.idx[i];
+	cs.idx[i] = id;
+}
+
+static void idx_remove(uint32_t id)
+{
+	for (uint64_t i = cs.rhash[id] & cs.idx_mask; cs.idx[i]; i = (i + 1) & cs.idx_mask)
+		if (cs.idx[i] == id) {
+			cs.idx[i] = IDX_GONE;
+			return;
+		}
+}
+
+static uint32_t idx_find(uint64_t h)
+{
+	for (uint64_t i = h & cs.idx_mask; cs.idx[i]; i = (i + 1) & cs.idx_mask)
+		if (cs.idx[i] != IDX_GONE && cs.rhash[cs.idx[i]] == h)
+			return cs.idx[i];
+	return 0;
+}
+
+/* A new record with one page pointing at it, not yet written anywhere. */
+static uint32_t rec_alloc(uint64_t h)
+{
+	uint32_t id = cs.rfree;
+	if (!id)
+		return 0;
+	cs.rfree = cs.rref[id];
+	cs.rref[id] = 1;
+	cs.rhash[id] = h;
+	cs.rloc[id] = 0;
+	cs.recs++;
+	return id;
+}
+
+static void rec_unref(uint32_t id)
+{
+	if (--cs.rref[id])
+		return;
+	if (cs.rloc[id]) {
+		idx_remove(id);
+		loc_account(cs.rloc[id], 0);
+		cs.rloc[id] = 0;
+	}
+	cs.rref[id] = cs.rfree;
+	cs.rfree = id;
+	cs.recs--;
+}
+
+/* The page reads as zeros from now on. */
+static void map_drop(uint64_t lpn)
+{
+	uint32_t id = cs.map[lpn];
+	if (!id)
+		return;
+	cs.map[lpn] = 0;
+	cs.pages--;
+	rec_unref(id);
+}
+
+/* Point a page at a record; the caller has already counted the reference. */
+static void map_set(uint64_t lpn, uint32_t id)
+{
+	map_drop(lpn);
+	cs.map[lpn] = id;
+	cs.pages++;
+}
+
+/* Append records (header, data, header, data...) to the log and note where each now is. */
 static int log_append(const char *buf, size_t bytes)
 {
 	while (bytes) {
@@ -383,11 +522,7 @@ static int log_append(const char *buf, size_t bytes)
 			return EIO;
 		for (size_t pos = 0; pos < n; pos += REC_HDR + r.len) {
 			memcpy(&r, buf + pos, sizeof r);
-			map_drop(r.lpn);
-			cs.map[r.lpn] = E_VALID | (uint64_t)r.len << 40 | (at + pos);
-			cs.pages++;
-			cs.bytes += REC_HDR + r.len;
-			cs.live[s] += REC_HDR + r.len;
+			rec_place(r.id, E_MAKE(at + pos, r.len));
 		}
 		cs.used[s] += n;
 		buf += n, bytes -= n;
@@ -408,7 +543,7 @@ static size_t survivors(const char *src, uint32_t v, char *dst, size_t out, size
 		*all = 1;
 	for (size_t pos = 0; pos < cs.used[v]; pos += REC_HDR + r.len) {
 		memcpy(&r, src + pos, sizeof r);
-		if (!cs.map[r.lpn] || E_OFF(cs.map[r.lpn]) != (uint64_t)v * SEG + pos)
+		if (r.id > cs.rmax || !cs.rloc[r.id] || E_OFF(cs.rloc[r.id]) != (uint64_t)v * SEG + pos)
 			continue;
 		if (out + REC_HDR + r.len > limit) {
 			if (all)
@@ -489,15 +624,10 @@ static int evict(void)
 		return EIO;
 	if (!reuse)
 		cs.nsfree--;
-	cs.state[slot] = SEG_CLEANING; /* dropping its old records must not free it */
+	cs.state[slot] = SEG_CLEANING; /* its own records leaving must not free it */
 	for (size_t pos = 0; pos < out; pos += REC_HDR + r.len) {
 		memcpy(&r, cs.evbuf + pos, sizeof r);
-		map_drop(r.lpn);
-		cs.map[r.lpn] = E_VALID | (uint64_t)r.len << 40 | ((uint64_t)slot * SEG + pos);
-		cs.pages++;
-		cs.bytes += REC_HDR + r.len;
-		cs.sbytes += REC_HDR + r.len;
-		cs.live[slot] += REC_HDR + r.len;
+		rec_place(r.id, E_MAKE((uint64_t)slot * SEG + pos, r.len));
 	}
 	cs.used[slot] = out;
 	cs.seq[slot] = ++cs.clock;
@@ -595,37 +725,89 @@ static int page_is_zero(const char *p)
 	return !w && !memcmp(p, p + 8, BLK - 8);
 }
 
+/* Does this record, which has the same hash, really hold this page? Only looks in VRAM. */
+static int rec_matches(uint32_t id, const char *page)
+{
+	uint64_t e = cs.rloc[id];
+	if (E_OFF(e) >= phys_size || vram_rw(0, E_OFF(e) + REC_HDR, ct.stage, E_LEN(e)))
+		return 0;
+	if (E_LEN(e) == BLK)
+		return !memcmp(ct.stage, page, BLK);
+	return z.Decompress(ct.dc, ct.page, BLK, ct.stage, E_LEN(e)) == BLK && !memcmp(ct.page, page, BLK);
+}
+
 static int cs_write(uint64_t off, const char *buf, size_t len)
 {
-	uint64_t lpn = off / BLK, zero[MAX_PAGES / 64] = { 0 };
-	size_t n = len / BLK, out = 0;
+	enum { ZERO, SHARED, NEW };
+	uint64_t lpn = off / BLK, hash[MAX_PAGES];
+	uint32_t id[MAX_PAGES];
+	uint8_t kind[MAX_PAGES];
+	size_t n = len / BLK, out = 0, fresh = 0;
 	int err = 0;
 
 	if (off % BLK || len % BLK || n > MAX_PAGES)
 		return EINVAL;
 	ct_init();
 	for (size_t i = 0; i < n; i++) {
-		const char *p = buf + i * BLK;
-		if (page_is_zero(p)) {
-			zero[i / 64] |= 1ULL << (i % 64);
-			continue;
+		kind[i] = page_is_zero(buf + i * BLK) ? ZERO : NEW;
+		if (kind[i] == NEW)
+			hash[i] = page_hash(buf + i * BLK), fresh++;
+	}
+	/* A page we already hold a copy of just points at that copy. */
+	if (fresh) {
+		pthread_mutex_lock(&cs.lock);
+		for (size_t i = 0; i < n; i++) {
+			uint32_t r;
+			if (kind[i] != NEW || !(r = idx_find(hash[i])) || cs.rref[r] == UINT32_MAX ||
+			    !rec_matches(r, buf + i * BLK))
+				continue;
+			cs.rref[r]++;
+			id[i] = r;
+			kind[i] = SHARED;
+			fresh--;
 		}
+		pthread_mutex_unlock(&cs.lock);
+	}
+	for (size_t i = 0; i < n && fresh; i++) {
+		const char *p = buf + i * BLK;
+		if (kind[i] != NEW)
+			continue;
 		size_t c = z.Compress(ct.cc, ct.stage + out + REC_HDR, RAW_ABOVE, p, BLK, clevel);
 		if (z.IsError(c) || !c || c > RAW_ABOVE) {
 			memcpy(ct.stage + out + REC_HDR, p, BLK);
 			c = BLK;
 		}
-		struct rec r = { .lpn = lpn + i, .len = c };
+		struct rec r = { .len = c };
 		memcpy(ct.stage + out, &r, sizeof r);
 		out += REC_HDR + c;
 	}
 	pthread_mutex_lock(&cs.lock);
-	if (out && !(err = make_room(out)))
+	for (size_t i = 0, pos = 0; i < n && fresh; i++) { /* name the new records */
+		struct rec r;
+		if (kind[i] != NEW)
+			continue;
+		memcpy(&r, ct.stage + pos, sizeof r);
+		r.id = id[i] = rec_alloc(hash[i]);
+		memcpy(ct.stage + pos, &r, sizeof r);
+		pos += REC_HDR + r.len;
+		if (!r.id)
+			err = ENOSPC;
+	}
+	if (out && !err && !(err = make_room(out)))
 		err = log_append(ct.stage, out);
-	if (!err)
-		for (size_t i = 0; i < n; i++)
-			if (zero[i / 64] >> (i % 64) & 1)
+	for (size_t i = 0; i < n; i++) {
+		if (kind[i] == ZERO) {
+			if (!err)
 				map_drop(lpn + i);
+		} else if (err) {
+			if (id[i])
+				rec_unref(id[i]);
+		} else {
+			if (kind[i] == NEW)
+				idx_insert(id[i]);
+			map_set(lpn + i, id[i]);
+		}
+	}
 	pthread_mutex_unlock(&cs.lock);
 	return err;
 }
@@ -641,7 +823,7 @@ static int cs_read(uint64_t off, char *buf, size_t len)
 	ct_init();
 	pthread_mutex_lock(&cs.lock);
 	for (size_t i = 0; i < n;) {
-		uint64_t e = cs.map[lpn + i], start, end;
+		uint64_t e = cs.rloc[cs.map[lpn + i]], start, end;
 		if (!e) {
 			clen[i++] = 0;
 			continue;
@@ -653,7 +835,7 @@ static int cs_read(uint64_t off, char *buf, size_t len)
 			pos[i] = in + (end - start) + REC_HDR;
 			clen[i] = E_LEN(e);
 			end += REC_HDR + E_LEN(e);
-		} while (++i < n && (e = cs.map[lpn + i]) && E_OFF(e) == end && end != phys_size);
+		} while (++i < n && (e = cs.rloc[cs.map[lpn + i]]) && E_OFF(e) == end && end != phys_size);
 		int bad;
 		if (start < phys_size) {
 			bad = vram_rw(0, start, ct.stage + in, end - start);
@@ -719,20 +901,6 @@ static struct {
 	uint64_t cap, filled;
 	uint64_t writes, zero, same_block, bounced, duplicate, fresh, reads;
 } cn = { .lock = PTHREAD_MUTEX_INITIALIZER };
-
-static uint64_t page_hash(const char *p)
-{
-	uint64_t h[4] = { 0x9E3779B97F4A7C15ULL, 0xBF58476D1CE4E5B9ULL, 0x94D049BB133111EBULL, 0xD6E8FEB86659FD93ULL };
-	for (size_t i = 0; i < BLK; i += 32) {
-		uint64_t w[4];
-		memcpy(w, p + i, 32);
-		for (int k = 0; k < 4; k++)
-			h[k] = (h[k] ^ w[k]) * 0x100000001B3ULL, h[k] ^= h[k] >> 29;
-	}
-	uint64_t x = h[0] ^ h[1] * 3 ^ h[2] * 5 ^ h[3] * 7;
-	x ^= x >> 32, x *= 0xD6E8FEB86659FD93ULL, x ^= x >> 32;
-	return x ? x : 1;
-}
 
 static struct slot *cn_find(uint64_t h)
 {
@@ -859,6 +1027,7 @@ static void *stat_thread(void *arg)
 	for (;; sleep(2)) {
 		pthread_mutex_lock(&cs.lock);
 		uint64_t pages = cs.pages, bytes = cs.bytes - cs.sbytes, refused = cs.refused, sbytes = cs.sbytes;
+		uint64_t recs = cs.recs;
 		uint64_t held = (uint64_t)(cs.nseg - cs.nfree) * SEG;
 		pthread_mutex_unlock(&cs.lock);
 		int pct = bytes * 100 / phys_size;
@@ -877,10 +1046,10 @@ static void *stat_thread(void *arg)
 		if (!f)
 			continue;
 		fprintf(f, "PAGES=%llu\nSTORED_BYTES=%llu\nSEGMENT_BYTES=%llu\nVRAM_BYTES=%llu\nREFUSED=%llu\n"
-			   "SPILLED_BYTES=%llu\nSPILL_BYTES=%llu\n",
+			   "SPILLED_BYTES=%llu\nSPILL_BYTES=%llu\nRECORDS=%llu\n",
 			(unsigned long long)pages, (unsigned long long)bytes, (unsigned long long)held,
 			(unsigned long long)phys_size, (unsigned long long)refused,
-			(unsigned long long)sbytes, (unsigned long long)spill_size);
+			(unsigned long long)sbytes, (unsigned long long)spill_size, (unsigned long long)recs);
 		fclose(f);
 		rename(tmp, path);
 	}
@@ -1574,6 +1743,9 @@ static void pattern(char *p, uint64_t blk, unsigned ver)
 	unsigned kind = ver == 255 ? 1 : (x >> 3) % 8;
 	size_t q = kind == 1 ? BLK : (256 + (x >> 8) % 1792) & ~7UL;
 
+	if (kind == 2) /* one of 500 pages that turn up all over the device */
+		blk = (x >> 20) % 500, x = blk * 0x9E3779B97F4A7C15ULL | 1, q = 1024;
+
 	if (!kind) {
 		memset(p, 0, BLK);
 		return;
@@ -1643,6 +1815,8 @@ static void selftest_compress(int threads)
 	printf("stored            %7llu MiB of pages in %llu MiB (%.2fx; the device offers %.2fx)\n",
 	       (unsigned long long)(dev_size / MiB), (unsigned long long)(cs.bytes / MiB),
 	       (double)dev_size / cs.bytes, cratio);
+	printf("                  %7llu pages share a copy with another (%.1f%%)\n",
+	       (unsigned long long)(cs.pages - cs.recs), (cs.pages - cs.recs) * 100.0 / npages);
 	if (spill_fd >= 0)
 		printf("                  %7llu MiB of that in VRAM, %llu MiB spilled to the file\n",
 		       (unsigned long long)((cs.bytes - cs.sbytes) / MiB), (unsigned long long)(cs.sbytes / MiB));
@@ -1724,7 +1898,7 @@ static void selftest_compress(int threads)
 	}
 	memset(tver, 0, npages);
 	memset(ta, 0, BLK);
-	if (cs.pages || cs.bytes || nbd_io(fd, NBD_CMD_READ, (npages / 2) * BLK, tb, BLK) || memcmp(ta, tb, BLK))
+	if (cs.pages || cs.recs || cs.bytes || nbd_io(fd, NBD_CMD_READ, (npages / 2) * BLK, tb, BLK) || memcmp(ta, tb, BLK))
 		die("selftest: discard did not empty the store");
 	if (put_pages(fd, 7, 3, 1))
 		die("selftest: write after discard failed");

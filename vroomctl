@@ -238,11 +238,12 @@ stats)
 		fi
 		if [ -r "/run/vroom/$kname.stat" ]; then
 			(. "/run/vroom/$kname.stat"; awk -v p="$PAGES" -v b="$STORED_BYTES" -v v="$VRAM_BYTES" \
-				-v s="$SPILLED_BYTES" -v r="$REFUSED" 'BEGIN { m = 1048576
+				-v s="$SPILLED_BYTES" -v r="$REFUSED" -v n="${RECORDS:-0}" 'BEGIN { m = 1048576
 				printf "  holding  %10.0f MiB of pages in %.0f MiB of VRAM", p * 4096 / m, b / m
 				if (s) printf " and %.0f MiB on disk", s / m
 				if (b + s >= m) printf " (%.2fx)", p * 4096 / (b + s)
 				printf "\n  VRAM     %9d%% full\n", b * 100 / v
+				if (p && n) printf "  sharing  %9.1f%% of pages are a second copy of another\n", (p - n) * 100 / p
 				if (r) printf "  REFUSED  %10d writes: the store was full\n", r }')
 		fi
 		if [ -r "/run/vroom/$kname.count" ]; then
