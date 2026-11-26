@@ -1,7 +1,7 @@
 Package: vroom
 Version: @VERSION@
 Architecture: @ARCH@
-Maintainer: vroom maintainers <maintainer@example.invalid>
+Maintainer: Jonathan Baker <jon@vitund.ai>
 Section: admin
 Priority: optional
 Depends: libc6, kmod, util-linux, e2fsprogs, systemd
