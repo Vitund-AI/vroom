@@ -2791,7 +2791,10 @@ static void selftest_compress(int threads)
 	double t;
 
 	tver = calloc(npages, 1);
-	ta = malloc(BUFSZ), tb = malloc(BUFSZ);
+	void *al[2]; /* aligned: the test reads the spill file directly, which a disk under LVM insists on */
+	if (posix_memalign(&al[0], BLK, BUFSZ) || posix_memalign(&al[1], BLK, BUFSZ))
+		die("selftest: out of memory");
+	ta = al[0], tb = al[1];
 	for (int i = 0; i < threads; i++) {
 		int sp[2];
 		if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp))
