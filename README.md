@@ -188,8 +188,11 @@ A spill file is made by the daemon, must not exist beforehand, and has no
 name while it is in use (`df` counts it, `ls` does not show it), so it is
 gone when the daemon is, however that happens. It needs a filesystem that
 can do direct I/O, which rules out tmpfs.
-When the card passes 90% full, the oldest pages move to the file; when it
-falls below 70% they come back. With the file as large as the device, which
+When the card passes 90% full, pages move to the file: the oldest first,
+but not those that have been read since the last time round, so what is
+read again and again stays on the card and what is written and left alone
+goes to the disk. When the card falls below 70% they come back, starting
+with whatever was read from the file most recently. With the file as large as the device, which
 is the default, writes are not refused for want of room. If the disk itself
 fails, pages already on it are lost with it, and writes are refused once
 the card is full instead of being left to wait. Pages in the file are read
@@ -222,7 +225,10 @@ plain devices are encrypted only if asked (`--encrypt`); two pages are taken to 
 the strength of their fingerprints, without comparing them (for any two
 pages the chance of a false match is below 1 in 2^95, far smaller than
 that of the hardware getting it wrong); the two water marks are fixed, not
-learned; and "oldest" is by when a page was last written or last moved.
+learned; "oldest" is by when a page was last written or last moved, and
+"read since the last time round" is all that is known about reads: nothing
+is predicted, and a page is spared for one turn through the card, not for
+longer.
 Storing one copy has the side channel it has everywhere (KSM, deduplicating
 filesystems): a local user who can time their own swap-outs may be able to
 tell that a page they wrote was already held for someone else. The counts

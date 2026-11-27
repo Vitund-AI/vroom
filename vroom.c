@@ -397,6 +397,7 @@ static struct {
 	uint64_t *rloc;	 /* where it is: E_MAKE(offset, length); 0 until it has been written */
 	struct fp *rfp;	 /* fingerprint of the page it holds */
 	uint32_t *rnon;	 /* the low half of the nonce it was sealed with: see cs_read */
+	uint8_t *rhot;	 /* read since evict() last came by: see there */
 	uint32_t *rref;	 /* how many pages point at it; for an unused id, the next unused one */
 	uint32_t rfree, rmax;
 	uint32_t *idx;	 /* open-addressed: hash -> a record holding that page */
@@ -409,6 +410,7 @@ static struct {
 	uint16_t *pins;	 /* readers at work in a spill segment, which must not be rewritten meanwhile */
 	uint8_t *hits;	 /* reads in a row that each went a little further into a spill segment */
 	uint32_t *lastoff; /* where in the segment the last of them ended */
+	uint64_t *touched; /* a spill segment: when it was last read from */
 	/*
 	 * Spill segments being read through in order are read once, whole, and
 	 * kept here: a megabyte in one read costs about three single pages.
@@ -430,7 +432,7 @@ static struct {
 	char *gcbuf, *evbuf, *rebuf;
 	uint64_t clock;
 	uint64_t pages, recs, bytes, sbytes; /* pages held, the records behind them, their bytes, and how much of that is spilled */
-	uint64_t cleaned, refused, evicted, returned;
+	uint64_t cleaned, refused, evicted, returned, spared;
 	uint64_t reread, mended, lost; /* pages that failed their check: right at a second reading, put right, or gone */
 } cs = { .lock = PTHREAD_MUTEX_INITIALIZER, .wake = PTHREAD_COND_INITIALIZER,
 	 .room = PTHREAD_COND_INITIALIZER };
@@ -661,12 +663,14 @@ static void cs_init(void)
 	cs.rfp = calloc(cs.rmax + 1, sizeof *cs.rfp);
 	cs.rref = calloc(cs.rmax + 1, sizeof *cs.rref);
 	cs.rnon = calloc(cs.rmax + 1, sizeof *cs.rnon);
+	cs.rhot = calloc(cs.rmax + 1, 1);
 	cs.idx = calloc(cap, sizeof *cs.idx);
 	cs.live = calloc(all, sizeof *cs.live);
 	cs.used = calloc(all, sizeof *cs.used);
 	cs.seq = calloc(all, sizeof *cs.seq);
 	cs.pins = calloc(all, sizeof *cs.pins);
 	cs.hits = calloc(all, 1);
+	cs.touched = calloc(all, sizeof *cs.touched);
 	cs.lastoff = calloc(all, sizeof *cs.lastoff);
 	for (int i = 0; spill_path && i < 16; i++)
 		if (posix_memalign(&p, BLK, SEG))
@@ -823,6 +827,7 @@ static uint32_t rec_alloc(const struct fp *h)
 	cs.rref[id] = 1;
 	cs.rfp[id] = *h;
 	cs.rloc[id] = 0;
+	cs.rhot[id] = 0;
 	cs.recs++;
 	return id;
 }
@@ -907,6 +912,8 @@ static int log_append(const char *buf, size_t bytes)
  */
 static uint64_t moved_from[SEG / (REC_HDR + 1) + 1]; /* by evict: where each record it is moving was */
 static size_t nmoved;
+static int ev_force;	/* evict: take records whether they have been read or not */
+static uint32_t ev_kept; /* how many it left behind in the segment it was last given */
 
 static size_t survivors(const char *src, uint32_t v, char *dst, size_t out, size_t limit, int *all)
 {
@@ -936,6 +943,11 @@ static size_t survivors(const char *src, uint32_t v, char *dst, size_t out, size
 		}
 		if (!ours)
 			continue;
+		if (dst == cs.evbuf && v < cs.nseg && cs.rhot[r.id] && !ev_force) {
+			cs.rhot[r.id] = 0; /* read since we were last here: it stays, this once */
+			ev_kept++;
+			continue;
+		}
 		if (out + REC_HDR + r.len > limit) {
 			if (all)
 				*all = 0;
@@ -977,9 +989,15 @@ static int spill_io(int wr, char *buf, size_t len, uint64_t off)
 }
 
 /*
- * Move up to one segment's worth of the oldest live records from VRAM to the
- * spill file. If the file has no free segment, its emptiest one is rewritten
- * with its own survivors first. Fails with ENOSPC when the file is full too.
+ * Move up to one segment's worth of live records from VRAM to the spill
+ * file: from the oldest segments, but only the records nobody has read
+ * since this last came by. One that has been read is left on the card with
+ * its mark rubbed out, and its segment goes to the back of the queue, so it
+ * is spilled only if a whole turn through the card passes without its being
+ * read again. What is read time and again therefore stays in VRAM, and it is
+ * what is written and then left alone that goes to the disk.
+ * If the file has no free segment, its emptiest one is rewritten with its
+ * own survivors first. Fails with ENOSPC when the file is full too.
  */
 static int evict(void)
 {
@@ -1016,17 +1034,34 @@ static int evict(void)
 		cs.sfree[cs.nsfree - 1] = slot;
 	}
 	size_t own = out;
+	uint64_t stop = cs.clock; /* segments sent to the back of the queue are not looked at twice */
+	int looked = 0;
+	ev_force = 0;
 	for (;;) {
 		uint64_t oldest = UINT64_MAX;
 		v = 0;
 		for (uint32_t s = 0; s < cs.nseg; s++)
-			if (cs.state[s] == SEG_CLOSED && cs.seq[s] > floor && cs.seq[s] < oldest)
+			if (cs.state[s] == SEG_CLOSED && cs.seq[s] > floor && cs.seq[s] <= stop && cs.seq[s] < oldest)
 				oldest = cs.seq[s], v = s;
+		/*
+		 * Room has to be made all the same. If a good many segments have
+		 * given nothing because all that is in them has been read lately,
+		 * start again and take the oldest as they come.
+		 */
+		if (out == own && !ev_force && looked && (oldest == UINT64_MAX || looked >= 32)) {
+			ev_force = 1, floor = 0, stop = cs.clock;
+			continue;
+		}
 		if (oldest == UINT64_MAX)
 			break;
 		if (vram_rw(0, (uint64_t)v * SEG, cs.gcbuf, cs.used[v]))
 			return EIO;
+		ev_kept = 0, looked++;
 		out = survivors(cs.gcbuf, v, cs.evbuf, out, SEG, &all);
+		if (ev_kept) {
+			cs.seq[v] = ++cs.clock;
+			cs.spared += ev_kept;
+		}
 		if (!all)
 			break;
 		floor = oldest;
@@ -1072,6 +1107,7 @@ static int evict(void)
 	}
 	cs.used[slot] = out;
 	cs.hits[slot] = 0;
+	cs.touched[slot] = 0;
 	held_drop(slot);
 	cs.seq[slot] = ++cs.clock;
 	cs.state[slot] = SEG_CLOSED;
@@ -1111,16 +1147,18 @@ static int clean_one(void)
 	return 0;
 }
 
-/* Bring the most recently spilled segment back onto the card. */
+/* Bring a spilled segment back onto the card: the one most recently read from, or else spilled. */
 static void rehydrate(void)
 {
 	uint32_t v = 0;
-	uint64_t newest = 0;
+	uint64_t newest = 0, best = 0;
 
-	for (uint32_t s = cs.nseg; s < cs.nseg + cs.nspill; s++)
-		if (cs.state[s] == SEG_CLOSED && cs.seq[s] > newest)
-			newest = cs.seq[s], v = s;
-	if (!newest)
+	for (uint32_t s = cs.nseg; s < cs.nseg + cs.nspill; s++) {
+		uint64_t when = cs.seq[s] > cs.touched[s] ? cs.seq[s] : cs.touched[s];
+		if (cs.state[s] == SEG_CLOSED && when > best)
+			best = when, newest = cs.seq[s], v = s;
+	}
+	if (!best)
 		return;
 	size_t span = (cs.used[v] + BLK - 1) & ~(size_t)(BLK - 1);
 	cs.pins[v]++; /* nothing may rewrite it while we read it with the lock dropped */
@@ -1425,6 +1463,7 @@ static int cs_read(uint64_t off, char *buf, size_t len)
 			pos[i] = in + (end - start) + REC_HDR;
 			clen[i] = E_LEN(e);
 			non[i] = cs.rnon[cs.map[lpn + i]];
+			cs.rhot[cs.map[lpn + i]] = 1;
 			end += REC_HDR + E_LEN(e);
 		} while (++i < n && (e = cs.rloc[cs.map[lpn + i]]) && E_OFF(e) == end && end != phys_size);
 		if (start < phys_size) {
@@ -1434,6 +1473,7 @@ static int cs_read(uint64_t off, char *buf, size_t len)
 		}
 		uint32_t g = start / SEG;
 		uint64_t in_seg = start - (uint64_t)g * SEG;
+		cs.touched[g] = cs.clock;
 		if ((end - 1) / SEG == g) {
 			struct held *h = NULL, *spare = NULL;
 			for (int k = 0; k < 16; k++) {
@@ -1843,6 +1883,7 @@ static void *stat_thread(void *arg)
 	for (unsigned tick = 0;; tick++, sleep(TICK)) {
 		pthread_mutex_lock(&cs.lock);
 		uint64_t pages = cs.pages, bytes = cs.bytes - cs.sbytes, refused = cs.refused, sbytes = cs.sbytes;
+		uint64_t spared = cs.spared;
 		uint64_t recs = cs.recs, waits = cs.waits, reread = cs.reread, mended = cs.mended, lost = cs.lost;
 		uint64_t held = (uint64_t)(cs.nseg - cs.nfree) * SEG;
 		pthread_mutex_unlock(&cs.lock);
@@ -1870,11 +1911,11 @@ static void *stat_thread(void *arg)
 		fchmod(fileno(f), 0600); /* how many pages share a copy says something about what they hold */
 		if (cratio)
 			fprintf(f, "COMPRESSED=1\nPAGES=%llu\nSTORED_BYTES=%llu\nSEGMENT_BYTES=%llu\nREFUSED=%llu\n"
-				   "SPILLED_BYTES=%llu\nSPILL_BYTES=%llu\nRECORDS=%llu\nWAITS=%llu\n",
+				   "SPILLED_BYTES=%llu\nSPILL_BYTES=%llu\nRECORDS=%llu\nWAITS=%llu\nSPARED=%llu\n",
 				(unsigned long long)pages, (unsigned long long)bytes, (unsigned long long)held,
 				(unsigned long long)refused, (unsigned long long)sbytes,
 				(unsigned long long)spill_size, (unsigned long long)recs,
-				(unsigned long long)waits);
+				(unsigned long long)waits, (unsigned long long)spared);
 		if (cratio || sealed)
 			fprintf(f, "REREAD=%llu\nMENDED=%llu\nUNREADABLE=%llu\n", (unsigned long long)reread,
 				(unsigned long long)mended, (unsigned long long)lost);
@@ -3223,6 +3264,39 @@ static void selftest_compress(int threads)
 		check_pages(fd, 0, 64, "after the spill came back");
 		printf("failing spill     writes refused after %.1f s, nothing lost, and resumed when it came back\n",
 		       now() - t);
+
+		/*
+		 * What is read again and again must stay on the card while what is
+		 * written and left alone goes to the disk. Start afresh and fill the
+		 * device; the first pages written, the oldest and so the first in
+		 * line, are read every few megabytes, and the next ones never.
+		 */
+		for (uint64_t off = 0; off < dev_size; off += 1024 * MiB) {
+			uint64_t n = dev_size - off < 1024 * MiB ? dev_size - off : 1024 * MiB;
+			if (nbd_io(fd, NBD_CMD_TRIM, off, NULL, n))
+				die("selftest: discard failed");
+		}
+		memset(tver, 254, npages);
+		uint64_t spared0 = cs.spared, nhot = 256, hot = 0, cold = 0;
+		for (b = 0, err = 0; b + 64 <= npages && !(err = put_pages(fd, b, 64, -1)); b += 64)
+			if (b >= 2 * nhot && b % 512 == 0)
+				for (uint64_t c = 0; c < nhot; c += 64)
+					check_pages(fd, c, 64, "reading pages kept on the card");
+		if (!cs.sbytes)
+			die("selftest: nothing spilled while filling the device");
+		for (uint64_t c = 0; c < nhot; c++) {
+			hot += E_OFF(cs.rloc[cs.map[c]]) < phys_size;
+			cold += E_OFF(cs.rloc[cs.map[nhot + c]]) < phys_size;
+		}
+		if (hot < nhot * 3 / 4 || cold > nhot / 4)
+			die("selftest: of %llu pages read all along %llu are still on the card, and of %llu never read, %llu",
+			    (unsigned long long)nhot, (unsigned long long)hot, (unsigned long long)nhot,
+			    (unsigned long long)cold);
+		check_all(fd, "after filling with some pages kept on the card");
+		printf("spill order       of %llu pages read all along %llu stayed on the card; of %llu never read, %llu "
+		       "(%llu spared in all)\n",
+		       (unsigned long long)nhot, (unsigned long long)hot, (unsigned long long)nhot,
+		       (unsigned long long)cold, (unsigned long long)(cs.spared - spared0));
 	}
 
 	for (uint64_t off = 0; off < dev_size; off += 1024 * MiB) {
