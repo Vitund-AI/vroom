@@ -159,6 +159,14 @@ def be_vroom_plain(a):  # no compression, no single copies, no encryption: the c
     return be_vroom(a, [])
 
 
+def be_vroom_plain_old(a):  # as vroom-plain, with each copy to the card waited for by itself, as it was
+    dev, undo = be_vroom(a, [])
+    with open("/etc/vroom/swapbench.conf", "a") as f:
+        f.write("VROOM_NO_BATCH=1\n")
+    sh("systemctl", "restart", "vroom@swapbench.service", quiet=True)
+    return dev, undo
+
+
 def be_vroom_enc(a):  # the same, with each block encrypted and checked
     return be_vroom(a, ["--encrypt"])
 
@@ -180,7 +188,8 @@ def be_vroom_x4(a):  # four compressed devices
 
 
 BACKENDS = {"none": be_none, "ssd": be_ssd, "ssd-dev": be_ssd_dev, "zswap": be_zswap, "zram": be_zram,
-            "vroom": be_vroom, "vroom-plain": be_vroom_plain, "vroom-enc": be_vroom_enc,
+            "vroom": be_vroom, "vroom-plain": be_vroom_plain, "vroom-plain-old": be_vroom_plain_old,
+            "vroom-enc": be_vroom_enc,
             "vroom-plain-q4": be_vroom_plain_q4, "vroom-plain-x4": be_vroom_plain_x4,
             "vroom-plain-x8": be_vroom_plain_x8, "vroom-x4": be_vroom_x4}
 

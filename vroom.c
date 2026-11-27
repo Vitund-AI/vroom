@@ -62,6 +62,7 @@
 /* ---- minimal CUDA driver API, resolved at runtime ---- */
 typedef unsigned long long CUdeviceptr;
 typedef struct CUctx_st *CUcontext;
+typedef struct CUstream_st *CUstream;
 static struct {
 	int (*Init)(unsigned);
 	int (*DeviceGet)(int *, int);
@@ -74,6 +75,10 @@ static struct {
 	int (*MemsetD8)(CUdeviceptr, unsigned char, size_t);
 	int (*HtoD)(CUdeviceptr, const void *, size_t);
 	int (*DtoH)(void *, CUdeviceptr, size_t);
+	int (*StreamCreate)(CUstream *, unsigned);
+	int (*HtoDAsync)(CUdeviceptr, const void *, size_t, CUstream);
+	int (*DtoHAsync)(void *, CUdeviceptr, size_t, CUstream);
+	int (*StreamSynchronize)(CUstream);
 } cu;
 
 static CUcontext ctx;
@@ -141,6 +146,10 @@ static int fk_host(void **p, size_t n) { return posix_memalign(p, BLK, n) ? 2 : 
 static int fk_set(CUdeviceptr p, unsigned char v, size_t n) { memset((void *)(uintptr_t)p, v, n); return 0; }
 static int fk_in(CUdeviceptr d, const void *s, size_t n) { memcpy((void *)(uintptr_t)d, s, n); return 0; }
 static int fk_out(void *d, CUdeviceptr s, size_t n) { memcpy(d, (void *)(uintptr_t)s, n); return 0; }
+static int fk_stream(CUstream *s, unsigned f) { (void)f; *s = NULL; return 0; }
+static int fk_ina(CUdeviceptr d, const void *s, size_t n, CUstream st) { (void)st; return fk_in(d, s, n); }
+static int fk_outa(void *d, CUdeviceptr s, size_t n, CUstream st) { (void)st; return fk_out(d, s, n); }
+static int fk_sync(CUstream s) { (void)s; return 0; }
 #endif
 
 static void vram_init(int gpu, uint64_t size_mib)
@@ -149,6 +158,7 @@ static void vram_init(int gpu, uint64_t size_mib)
 	cu.Init = fk_init, cu.DeviceGet = fk_dev, cu.DeviceGetName = fk_name, cu.CtxCreate = fk_ctx;
 	cu.CtxSetCurrent = fk_cur, cu.MemGetInfo = fk_info, cu.MemAlloc = fk_alloc, cu.MemAllocHost = fk_host;
 	cu.MemsetD8 = fk_set, cu.HtoD = fk_in, cu.DtoH = fk_out;
+	cu.StreamCreate = fk_stream, cu.HtoDAsync = fk_ina, cu.DtoHAsync = fk_outa, cu.StreamSynchronize = fk_sync;
 #else
 	void *lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
 	if (!lib)
@@ -164,6 +174,10 @@ static void vram_init(int gpu, uint64_t size_mib)
 	cu.MemsetD8 = sym(lib, "cuMemsetD8_v2");
 	cu.HtoD = sym(lib, "cuMemcpyHtoD_v2");
 	cu.DtoH = sym(lib, "cuMemcpyDtoH_v2");
+	cu.StreamCreate = sym(lib, "cuStreamCreate");
+	cu.HtoDAsync = sym(lib, "cuMemcpyHtoDAsync_v2");
+	cu.DtoHAsync = sym(lib, "cuMemcpyDtoHAsync_v2");
+	cu.StreamSynchronize = sym(lib, "cuStreamSynchronize");
 #endif
 
 	int dev, r;
@@ -292,6 +306,30 @@ static int vram_rw(int wr, uint64_t off, char *buf, size_t len)
 		off += n, buf += n, len -= n;
 	}
 	perf_end(wr ? P_VRAM_WRITE : P_VRAM_READ, whole, t0);
+	return 0;
+}
+
+/*
+ * Ask for a copy without waiting for it: it is done, in the order asked, by
+ * the time cu.StreamSynchronize(s) returns. The driver does plain copies one
+ * at a time for the whole process, each with its own wait; copies asked for
+ * this way share one wait, and several threads' worth run side by side. buf
+ * must be page-locked memory from the driver.
+ */
+static int vram_send(int wr, uint64_t off, char *buf, size_t len, CUstream s)
+{
+	while (len) {
+		uint64_t ci = off / CHUNK, co = off % CHUNK;
+		size_t n = len < CHUNK - co ? len : CHUNK - co;
+		int r = wr ? cu.HtoDAsync(chunks[ci] + co, buf, n, s) : cu.DtoHAsync(buf, chunks[ci] + co, n, s);
+		if (r) {
+			if (say())
+				fprintf(stderr, "vroom: VRAM %s failed at offset %llu (CUDA error %d)\n",
+					wr ? "write" : "read", (unsigned long long)off, r);
+			return -1;
+		}
+		off += n, buf += n, len -= n;
+	}
 	return 0;
 }
 
@@ -2377,6 +2415,18 @@ static void *ublk_queue(void *arg)
 	char *buf[UBLK_DEPTH];
 	struct slow *slow = calloc(UBLK_DEPTH, sizeof *slow);
 	int handoff = cratio != 0;
+	/*
+	 * A plain device: everything that arrived together is copied together,
+	 * and answered after one wait for the lot.
+	 */
+	struct {
+		unsigned tag;
+		int res, wr;
+		uint64_t t_req, t_vram;
+	} sent[UBLK_DEPTH];
+	unsigned nsent = 0;
+	CUstream stream = NULL;
+	int together = !cratio && !sealed && !getenv("VROOM_NO_BATCH");
 
 	cu.CtxSetCurrent(ctx);
 	prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0);
@@ -2396,12 +2446,17 @@ static void *ublk_queue(void *arg)
 
 	for (int tag = 0; tag < UBLK_DEPTH; tag++) {
 		void *p;
-		if (cu.MemAllocHost(&p, ublk_io_bytes) && posix_memalign(&p, BLK, ublk_io_bytes))
-			die("cannot allocate I/O buffer");
+		if (cu.MemAllocHost(&p, ublk_io_bytes)) {
+			together = 0; /* not page-locked, so the driver would copy it twice */
+			if (posix_memalign(&p, BLK, ublk_io_bytes))
+				die("cannot allocate I/O buffer");
+		}
 		buf[tag] = p;
 		struct ublksrv_io_cmd c = { .q_id = q, .tag = tag, .addr = (uintptr_t)p };
 		ring_cmd(&ring, cdev_fd, UBLK_U_IO_FETCH_REQ, &c, sizeof c, tag);
 	}
+	if (together && cu.StreamCreate(&stream, 1)) /* 1: a stream of its own, not in step with the default one */
+		together = 0;
 	if (handoff) {
 		pthread_mutex_init(&qdone[q].lock, NULL);
 		qdone[q].efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -2471,7 +2526,18 @@ static void *ublk_queue(void *arg)
 			case UBLK_IO_OP_WRITE:
 				if (len > ublk_io_bytes || off + len > dev_size)
 					res = -EINVAL;
-				else if ((res = -dev_rw((d->op_flags & 0xff) == UBLK_IO_OP_WRITE, off,
+				else if (together) {
+					int kr = is_write ? P_REQ_WRITE : P_REQ_READ, kv = is_write ? P_VRAM_WRITE : P_VRAM_READ;
+					sent[nsent] = (typeof(sent[0])){ .tag = tag, .wr = is_write, .res = len,
+									 .t_req = perf_begin(kr, len),
+									 .t_vram = perf_begin(kv, len) };
+					if (counting && !(off % BLK))
+						count_io(is_write, off, buf[tag], len);
+					if (vram_send(is_write, off, buf[tag], len, stream))
+						sent[nsent].res = -EIO;
+					nsent++;
+					continue; /* answered below, with the others */
+				} else if ((res = -dev_rw((d->op_flags & 0xff) == UBLK_IO_OP_WRITE, off,
 							buf[tag], len)) == 0)
 					res = len;
 				break;
@@ -2491,6 +2557,22 @@ static void *ublk_queue(void *arg)
 			struct ublksrv_io_cmd c = { .q_id = q, .tag = tag, .result = res,
 						    .addr = (uintptr_t)buf[tag] };
 			ring_cmd(&ring, cdev_fd, UBLK_U_IO_COMMIT_AND_FETCH_REQ, &c, sizeof c, tag);
+		}
+		if (nsent) {
+			if ((r = cu.StreamSynchronize(stream)) && say())
+				fprintf(stderr, "vroom: VRAM copies failed (CUDA error %d)\n", r);
+			for (unsigned i = 0; i < nsent; i++) {
+				const struct ublksrv_io_desc *d = &iod[sent[i].tag];
+				size_t len = (size_t)d->nr_sectors << 9;
+				if (r)
+					sent[i].res = -EIO;
+				perf_end(sent[i].wr ? P_VRAM_WRITE : P_VRAM_READ, len, sent[i].t_vram);
+				perf_end(sent[i].wr ? P_REQ_WRITE : P_REQ_READ, len, sent[i].t_req);
+				struct ublksrv_io_cmd c = { .q_id = q, .tag = sent[i].tag, .result = sent[i].res,
+							    .addr = (uintptr_t)buf[sent[i].tag] };
+				ring_cmd(&ring, cdev_fd, UBLK_U_IO_COMMIT_AND_FETCH_REQ, &c, sizeof c, sent[i].tag);
+			}
+			nsent = 0;
 		}
 		__atomic_store_n(ring.cq_head, head, __ATOMIC_RELEASE);
 	}
