@@ -167,6 +167,27 @@ def be_vroom_plain_old(a):  # as vroom-plain, with each copy to the card waited 
     return dev, undo
 
 
+def be_vroom_prio(a, how, cmd):  # a plain device whose daemon is put ahead of the workload for a core
+    dev, undo = be_vroom(a, how)
+    pid = subprocess.check_output(["systemctl", "show", "-p", "MainPID", "--value",
+                                   "vroom@swapbench.service"], text=True).strip()
+    for tid in os.listdir(f"/proc/{pid}/task"):
+        sh(*cmd, tid, quiet=True)
+    return dev, undo
+
+
+def be_vroom_plain_nice(a):
+    return be_vroom_prio(a, [], ["renice", "-n", "-20", "-p"])
+
+
+def be_vroom_plain_rt(a):
+    return be_vroom_prio(a, [], ["chrt", "-f", "-p", "10"])
+
+
+def be_vroom_plain_q4_rt(a):
+    return be_vroom_prio(a, ["--threads", "4"], ["chrt", "-f", "-p", "10"])
+
+
 def be_vroom_enc(a):  # the same, with each block encrypted and checked
     return be_vroom(a, ["--encrypt"])
 
@@ -189,6 +210,8 @@ def be_vroom_x4(a):  # four compressed devices
 
 BACKENDS = {"none": be_none, "ssd": be_ssd, "ssd-dev": be_ssd_dev, "zswap": be_zswap, "zram": be_zram,
             "vroom": be_vroom, "vroom-plain": be_vroom_plain, "vroom-plain-old": be_vroom_plain_old,
+            "vroom-plain-nice": be_vroom_plain_nice, "vroom-plain-rt": be_vroom_plain_rt,
+            "vroom-plain-q4-rt": be_vroom_plain_q4_rt,
             "vroom-enc": be_vroom_enc,
             "vroom-plain-q4": be_vroom_plain_q4, "vroom-plain-x4": be_vroom_plain_x4,
             "vroom-plain-x8": be_vroom_plain_x8, "vroom-x4": be_vroom_x4}
