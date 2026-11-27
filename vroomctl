@@ -15,6 +15,7 @@
 #   --raw           just the block device, at /dev/vroom/NAME
 #   --backend ublk|nbd   kernel interface (default: ublk when available)
 #   --gpu N         CUDA index of the GPU (0)
+#   --threads N     queues (ublk) or connections (nbd) serving the device (1 and 4)
 #   --compress      compress pages; the device is RATIO times the VRAM (swap and raw only)
 #   --ratio X       how much larger (1.5; 2.2 with --spill)
 #   --spill PATH    what does not fit in the VRAM goes here: a file, a directory to
@@ -142,7 +143,7 @@ add)
 	exec 9< "$CONF_DIR"
 	flock 9 # two adds at once must not pick the same device
 	size=0 mode=swap prio=100 mnt='' mntmode=1777 backend='' gpu=0 boot=0
-	compress=0 ratio='' spill='' spillsize=0 ciph=aes encrypt=0
+	compress=0 ratio='' spill='' spillsize=0 ciph=aes encrypt=0 threads=0
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--size) size=${2:?}; shift ;;
@@ -153,6 +154,7 @@ add)
 		--mode) mntmode=${2:?}; shift ;;
 		--backend) backend=${2:?}; shift ;;
 		--gpu) gpu=${2:?}; shift ;;
+		--threads) threads=${2:?}; shift ;;
 		--boot) boot=1 ;;
 		--compress) compress=1 ;;
 		--ratio) compress=1; ratio=${2:?}; shift ;;
@@ -164,6 +166,7 @@ add)
 		esac
 		shift
 	done
+	[[ $threads =~ ^[0-9]+$ ]] || die "--threads takes a number"
 	[[ $size =~ ^[0-9]+$ && $prio =~ ^-?[0-9]+$ && $gpu =~ ^[0-9]+$ && $mntmode =~ ^[0-7]{3,4}$ ]] ||
 		die "--size, --prio and --gpu take numbers; --mode takes an octal mode"
 	if [ "$mode" = mount ]; then
@@ -209,6 +212,7 @@ add)
 		echo "VROOM_DEV=$(pick_dev "$backend")"
 		echo "VROOM_SIZE_MIB=$size"
 		echo "VROOM_GPU=$gpu"
+		[ "$threads" != 0 ] && echo "VROOM_THREADS=$threads"
 		echo "VROOM_MODE=$mode"
 		echo "VROOM_COMPRESS=$ratio"
 		[ -n "$spill" ] && printf 'VROOM_SPILL=%s\nVROOM_SPILL_MIB=%s\n' "$spill" "$spillsize"
