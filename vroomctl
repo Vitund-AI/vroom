@@ -20,7 +20,9 @@
 #   --spill PATH    what does not fit in the VRAM goes here: a file, a directory to
 #                   put one in, or a whole empty disk or partition such as /dev/sdb
 #   --spill-size MiB   size of that file (default: the size of the device)
-#   --cipher aes|chacha20   what a compressed device is encrypted with (aes)
+#   --encrypt       encrypt and check a device that is not compressed (a compressed one
+#                   always is): a flipped bit is put right, worse is an error
+#   --cipher aes|chacha20   what it is encrypted with (aes)
 #   --boot          also start at every boot
 # Contents never survive a stop or reboot. Definitions live in /etc/vroom/NAME.conf.
 set -euo pipefail
@@ -140,7 +142,7 @@ add)
 	exec 9< "$CONF_DIR"
 	flock 9 # two adds at once must not pick the same device
 	size=0 mode=swap prio=100 mnt='' mntmode=1777 backend='' gpu=0 boot=0
-	compress=0 ratio='' spill='' spillsize=0 ciph=aes
+	compress=0 ratio='' spill='' spillsize=0 ciph=aes encrypt=0
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--size) size=${2:?}; shift ;;
@@ -156,7 +158,8 @@ add)
 		--ratio) compress=1; ratio=${2:?}; shift ;;
 		--spill) compress=1; spill=${2:?}; shift ;;
 		--spill-size) spillsize=${2:?}; shift ;;
-		--cipher) compress=1; ciph=${2:?}; shift ;;
+		--encrypt) encrypt=1 ;;
+		--cipher) encrypt=1; ciph=${2:?}; shift ;;
 		*) die "unknown option: $1" ;;
 		esac
 		shift
@@ -171,13 +174,13 @@ add)
 	fi
 	[ -e "$CONF_DIR/$name.conf" ] && die "$name already exists (vroomctl remove $name)"
 	no_start
+	[ "$ciph" = aes ] || [ "$ciph" = chacha20 ] || die "--cipher is aes or chacha20"
 	if [ "$compress" = 1 ]; then
 		# A full compressed store refuses writes: swap survives that, a filesystem does not.
 		[ "$mode" = mount ] && die "--compress is for --swap and --raw, not --mount"
 		[ -n "$ratio" ] || { [ -n "$spill" ] && ratio=2.2 || ratio=1.5; }
 		[[ $ratio =~ ^([1-7](\.[0-9]+)?|8(\.0+)?)$ ]] || die "--ratio takes a number from 1 to 8, such as 1.5"
 		[[ $spillsize =~ ^[0-9]+$ ]] || die "--spill-size takes a number of MiB"
-		[ "$ciph" = aes ] || [ "$ciph" = chacha20 ] || die "--cipher is aes or chacha20"
 		if [ -n "$spill" ]; then
 			[[ $spill =~ ^/[A-Za-z0-9._/@:+-]*$ ]] || die "--spill needs an absolute path of letters, digits and . _ - + @ :"
 			[ -d "$spill" ] && spill=${spill%/}/vroom-$name.spill
@@ -209,7 +212,8 @@ add)
 		echo "VROOM_MODE=$mode"
 		echo "VROOM_COMPRESS=$ratio"
 		[ -n "$spill" ] && printf 'VROOM_SPILL=%s\nVROOM_SPILL_MIB=%s\n' "$spill" "$spillsize"
-		[ "$compress" = 1 ] && echo "VROOM_CIPHER=$ciph"
+		[ "$compress" = 0 ] && [ "$encrypt" = 1 ] && echo "VROOM_ENCRYPT=1"
+		[ "$compress$encrypt" != 00 ] && echo "VROOM_CIPHER=$ciph"
 		[ "$mode" = swap ] && echo "VROOM_PRIO=$prio"
 		[ "$mode" = mount ] && printf 'VROOM_MOUNT=%s\nVROOM_MOUNT_MODE=%s\n' "$mnt" "$mntmode"
 	} > "$conf"
@@ -220,6 +224,8 @@ add)
 		die "could not start $name; nothing was added"
 	fi
 	[ "$boot" = 1 ] && systemctl enable -q "vroom@$name.service"
+	# swap has to be out of the way before the machine sleeps: see vroom-sleep.service
+	if [ "$mode" = swap ]; then systemctl enable -q vroom-sleep.service 2>/dev/null || true; fi
 	exec "$0" list
 	;;
 remove)
@@ -294,7 +300,8 @@ list | status)
 		echo "         Running devices are unaffected, but none can be started until you reboot: do not stop them."
 	fi
 	if grep -qs 'PreserveVideoMemoryAllocations: 0' /proc/driver/nvidia/params; then
-		echo "WARNING: the driver does not preserve VRAM across suspend; suspending destroys device contents"
+		echo "WARNING: the driver does not preserve VRAM across suspend: what a mounted or raw device holds is lost"
+		echo "         by suspending. (Swap devices are emptied and stopped before sleep, and started again after.)"
 	fi
 	;;
 stats)
@@ -370,13 +377,14 @@ stats)
 					printf "  %-12s %s writes have had to wait for room on the card\n", "housekeeping", (v["WAITS"] > 0 ? count(v["WAITS"]) : "no")
 				if (v["REFUSED"] > 0)
 					printf "  %-12s %d WRITES, because the store was full\n", "REFUSED", v["REFUSED"]
-				if ("MENDED" in v) {
-					if (v["MENDED"] + v["REREAD"] + v["UNREADABLE"] == 0)
-						printf "  %-12s no stored page has failed its check\n", "integrity"
-					else
-						printf "  %-12s %d pages had a flipped bit put right, %d read right at the second try, %d UNREADABLE\n", "integrity", v["MENDED"], v["REREAD"], v["UNREADABLE"]
-				}
 			}
+			if ("MENDED" in v) {
+				if (v["MENDED"] + v["REREAD"] + v["UNREADABLE"] == 0)
+					printf "  %-12s no stored page has failed its check\n", "integrity"
+				else
+					printf "  %-12s %d pages had a flipped bit put right, %d read right at the second try, %d UNREADABLE\n", "integrity", v["MENDED"], v["REREAD"], v["UNREADABLE"]
+			} else if (v["CIPHER"] == "none")
+				printf "  %-12s not checked: what the card holds is what is returned\n", "integrity"
 			if (v["CIPHER"] == "aes") c = "AES-256-GCM, key only in the daemon'\''s memory"
 			else if (v["CIPHER"] == "chacha20") c = "ChaCha20-Poly1305, key only in the daemon'\''s memory"
 			else if (v["CIPHER"] == "none") c = "none: pages are on the card as they are"
@@ -413,6 +421,55 @@ stats)
 bench)
 	load "${1:?usage: vroomctl bench NAME}"
 	exec "$here/vroom" --bench "$DEV"
+	;;
+_sleep)
+	# From vroom-sleep.service, before the machine suspends or hibernates:
+	# empty and stop every swap device, and note which, for _wake.
+	need_root
+	mkdir -p /run/vroom
+	: > /run/vroom/asleep
+	rc=0
+	for f in "$CONF_DIR"/*.conf; do
+		[ -e "$f" ] || continue
+		load "$(basename "$f" .conf)"
+		[ "$(systemctl is-active "$unit" 2>/dev/null)" = active ] || continue
+		if [ "$VROOM_MODE" != swap ]; then
+			if grep -qs 'PreserveVideoMemoryAllocations: 0' /proc/driver/nvidia/params; then
+				echo "vroom: $name is left as it is; the driver is not set to keep VRAM, so its contents may not survive" >&2
+			fi
+			continue
+		fi
+		echo "vroom: emptying and stopping $name before sleep"
+		# Empty it first: a daemon whose device is still swap does not stop.
+		if ! detach || ! systemctl stop "$unit"; then
+			echo "vroom: $name could not be emptied (no room in RAM and other swap for what it holds?): not going to sleep" >&2
+			rc=1
+			break
+		fi
+		echo "$name" >> /run/vroom/asleep
+	done
+	# Called off: nothing will run _wake for us, so put back what was stopped.
+	if [ $rc != 0 ]; then "$0" _wake || true; fi
+	exit $rc
+	;;
+_wake)
+	# On waking, or when going to sleep was called off: start what _sleep stopped.
+	# The driver may not have the card ready yet, so try for a while.
+	need_root
+	[ -s /run/vroom/asleep ] || exit 0
+	rc=0
+	while read -r n; do
+		load "$n"
+		ok=0
+		for _ in $(seq 20); do
+			if systemctl start "$unit" 2>/dev/null; then ok=1; break; fi
+			systemctl reset-failed "$unit" 2>/dev/null || true
+			sleep 3
+		done
+		if [ $ok = 1 ]; then echo "vroom: $n started again"; else echo "vroom: $n could not be started again: vroomctl start $n" >&2; rc=1; fi
+	done < /run/vroom/asleep
+	rm -f /run/vroom/asleep
+	exit $rc
 	;;
 selftest)
 	exec "$here/vroom" --selftest "$@"

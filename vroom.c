@@ -79,6 +79,8 @@ static struct {
 static CUcontext ctx;
 static void cs_init(void);
 static double cratio;   /* --compress: how much larger than the VRAM the device is; 0: off */
+static int sealed;      /* --encrypt on a device that is not compressed: see ps_write */
+static void crypt_init(void);
 static uint64_t phys_size; /* VRAM behind the device; the same as dev_size unless compressing */
 static CUdeviceptr *chunks;
 static uint64_t dev_size;
@@ -186,6 +188,13 @@ static void vram_init(int gpu, uint64_t size_mib)
 	phys_size = dev_size = size_mib * MiB;
 	fprintf(stderr, "vroom: %s: %llu MiB free of %llu MiB, taking %llu MiB\n", name,
 		free_b / MiB, total_b / MiB, (unsigned long long)size_mib);
+	if (sealed) {
+		/* each 4K block is stored with a 32-byte header in front of it */
+		dev_size = phys_size / (BLK + 32) * BLK & ~(uint64_t)(MiB - 1);
+		if (!dev_size)
+			die("--encrypt needs at least 2 MiB");
+		fprintf(stderr, "vroom: encrypting: offering %llu MiB\n", (unsigned long long)(dev_size / MiB));
+	}
 	if (cratio) {
 		if (size_mib < 16)
 			die("--compress needs at least 16 MiB");
@@ -208,6 +217,8 @@ static void vram_init(int gpu, uint64_t size_mib)
 	}
 	if (cratio)
 		cs_init();
+	else if (sealed)
+		crypt_init();
 }
 
 /*
@@ -453,8 +464,8 @@ static void ct_init(void)
 	if (posix_memalign(&p, BLK, 6 * BLK))
 		die("cannot allocate staging buffer");
 	ct.fix = memset(p, 0, 6 * BLK), ct.work = ct.fix + 3 * BLK;
-	ct.cc = z.CreateCCtx();
-	ct.dc = z.CreateDCtx();
+	ct.cc = cratio ? z.CreateCCtx() : ct.stage;
+	ct.dc = cratio ? z.CreateDCtx() : ct.stage;
 	ct.seal = ev.CtxNew();
 	ct.open = ev.CtxNew();
 	ct.print = ev.CtxNew();
@@ -473,12 +484,15 @@ static void ct_init(void)
 	char *page = ct.stage, *packed = ct.stage + BLK, *back = ct.stage + 2 * BLK;
 	for (size_t i = 0; i < BLK; i++)
 		page[i] = i / 64;
-	size_t c = z.Compress(ct.cc, packed, RAW_ABOVE, page, BLK, clevel);
-	if (z.IsError(c) || !c || c > RAW_ABOVE)
+	size_t c = 2048;
+	if (!cratio)
+		memcpy(packed, page, c), memcpy(back, page, BLK);
+	else if (c = z.Compress(ct.cc, packed, RAW_ABOVE, page, BLK, clevel), z.IsError(c) || !c || c > RAW_ABOVE)
 		die("cannot compress");
 	r.len = c;
 	if (page_print(page, &f) || rec_crypt(1, &r, packed) || rec_crypt(0, &r, packed) ||
-	    z.Decompress(ct.dc, back, BLK, packed, c) != BLK || memcmp(page, back, BLK))
+	    (cratio ? z.Decompress(ct.dc, back, BLK, packed, c) != BLK : memcmp(packed, page, c)) ||
+	    memcmp(page, back, BLK))
 		die("compression and encryption do not give back what went in");
 }
 
@@ -486,7 +500,7 @@ static void ct_init(void)
 static int threads_ready;
 static void thread_ready(void)
 {
-	if (cratio)
+	if (cratio || sealed)
 		ct_init();
 	__atomic_add_fetch(&threads_ready, 1, __ATOMIC_RELEASE);
 }
@@ -529,18 +543,11 @@ static int rec_crypt(int seal, struct rec *r, char *data)
 	return seal && ev.Ctrl(c, 0x10 /* get tag */, 16, r->tag) != 1 ? -1 : 0;
 }
 
-static void cs_init(void)
+static void crypt_init(void)
 {
-	void *lib = dlopen("libzstd.so.1", RTLD_NOW), *p;
-	if (!lib)
-		die("--compress needs libzstd.so.1: %s", dlerror());
-	z.CreateCCtx = sym(lib, "ZSTD_createCCtx");
-	z.CreateDCtx = sym(lib, "ZSTD_createDCtx");
-	z.Compress = sym(lib, "ZSTD_compressCCtx");
-	z.Decompress = sym(lib, "ZSTD_decompressDCtx");
-	z.IsError = sym(lib, "ZSTD_isError");
+	void *lib;
 	if (!(lib = dlopen("libcrypto.so.3", RTLD_NOW)))
-		die("--compress needs libcrypto.so.3: %s", dlerror());
+		die("encryption needs libcrypto.so.3: %s", dlerror());
 	ev.CtxNew = sym(lib, "EVP_CIPHER_CTX_new");
 	ev.Aes = sym(lib, "EVP_aes_256_gcm");
 	ev.ChaCha = sym(lib, "EVP_chacha20_poly1305");
@@ -557,6 +564,19 @@ static void cs_init(void)
 	if (getrandom(cipher_key, sizeof cipher_key, 0) != sizeof cipher_key ||
 	    getrandom(print_key, sizeof print_key, 0) != sizeof print_key)
 		die("cannot get random bytes for the keys: %s", strerror(errno));
+}
+
+static void cs_init(void)
+{
+	void *lib = dlopen("libzstd.so.1", RTLD_NOW), *p;
+	if (!lib)
+		die("--compress needs libzstd.so.1: %s", dlerror());
+	z.CreateCCtx = sym(lib, "ZSTD_createCCtx");
+	z.CreateDCtx = sym(lib, "ZSTD_createDCtx");
+	z.Compress = sym(lib, "ZSTD_compressCCtx");
+	z.Decompress = sym(lib, "ZSTD_decompressDCtx");
+	z.IsError = sym(lib, "ZSTD_isError");
+	crypt_init();
 	/* Nobody outside should be able to make two pages hash alike on purpose. */
 	if (getrandom(&hash_secret, sizeof hash_secret, 0) != sizeof hash_secret)
 		hash_secret = (uint64_t)time(NULL) * 0x9E3779B97F4A7C15ULL ^ (uintptr_t)&lib;
@@ -1520,6 +1540,105 @@ static int cs_read(uint64_t off, char *buf, size_t len)
 	return 0;
 }
 
+/*
+ * ---- a plain device, encrypted and checked (--encrypt) ----
+ *
+ * No compression and no tables: block N of the device is always at the same
+ * place on the card, as a record of 32 bytes of header and the 4K block
+ * encrypted. So the device is a little smaller than the VRAM (by 1/129th),
+ * what is on the card is noise without the key, and a block that has
+ * rotted is found out, and put right if one bit did it. The header's id is
+ * the block's number, so a record moved to another place is refused too. A
+ * header of all zeros is a block never written, which reads as zeros.
+ */
+#define SLOT ((size_t)REC_HDR + BLK)
+
+static int ps_open(char *slot, uint64_t lpn, char *p)
+{
+	static const struct rec none;
+	struct rec r;
+
+	memcpy(&r, slot, sizeof r);
+	if (!memcmp(&r, &none, sizeof r)) {
+		memset(p, 0, BLK);
+		return 0;
+	}
+	if (r.id != (uint32_t)lpn || r.len != BLK || rec_crypt(0, &r, slot + REC_HDR))
+		return -1;
+	memcpy(p, slot + REC_HDR, BLK);
+	return 0;
+}
+
+/* As rescue() does for the compressed store: read it again, then try it with each bit turned over. */
+static int ps_rescue(uint64_t lpn, char *p)
+{
+	long bit = -1, nbits = SLOT * 8;
+	int err = vram_rw(0, lpn * SLOT, ct.fix, SLOT), mended = 0;
+
+	for (; !err; bit++) {
+		if (bit == nbits) {
+			err = EIO;
+			break;
+		}
+		memcpy(ct.work, ct.fix, SLOT);
+		if (bit >= 0)
+			ct.work[bit >> 3] ^= 1 << (bit & 7);
+		if (!ps_open(ct.work, lpn, p))
+			break;
+	}
+	if (!err && bit >= 0) {
+		ct.fix[bit >> 3] ^= 1 << (bit & 7);
+		mended = !vram_rw(1, lpn * SLOT + (bit >> 3), ct.fix + (bit >> 3), 1);
+	}
+	pthread_mutex_lock(&cs.lock);
+	if (err)
+		cs.lost++;
+	else if (bit < 0)
+		cs.reread++;
+	else
+		cs.mended++;
+	pthread_mutex_unlock(&cs.lock);
+	if (say()) {
+		if (err)
+			fprintf(stderr, "vroom: block %llu has been altered or damaged beyond repair\n",
+				(unsigned long long)lpn);
+		else if (bit < 0)
+			fprintf(stderr, "vroom: block %llu read wrong once and right the second time\n",
+				(unsigned long long)lpn);
+		else
+			fprintf(stderr, "vroom: block %llu had one bit flipped: found%s\n",
+				(unsigned long long)lpn, mended ? " and put right" : "");
+	}
+	return err ? EIO : 0;
+}
+
+static int ps_rw(int wr, uint64_t off, char *buf, size_t len)
+{
+	uint64_t lpn = off / BLK;
+	size_t n = len / BLK;
+
+	if (off % BLK || len % BLK || n > MAX_PAGES)
+		return EINVAL;
+	ct_init();
+	if (!wr && vram_rw(0, lpn * SLOT, ct.stage, n * SLOT))
+		return EIO;
+	for (size_t i = 0; i < n; i++) {
+		char *slot = ct.stage + i * SLOT, *p = buf + i * BLK;
+		struct rec r = { .id = (uint32_t)(lpn + i), .len = BLK };
+
+		if (!wr) {
+			if (ps_open(slot, lpn + i, p) && ps_rescue(lpn + i, p))
+				return EIO;
+			continue;
+		}
+		memcpy(slot + REC_HDR, p, BLK);
+		if (rec_crypt(1, &r, slot + REC_HDR))
+			return EIO;
+		memcpy(slot, &r, sizeof r);
+	}
+	return wr && vram_rw(1, lpn * SLOT, ct.stage, n * SLOT) ? EIO : 0;
+}
+
 /* Would reading this have to wait for the spill file? */
 static int cs_reads_spill(uint64_t off, size_t len)
 {
@@ -1650,7 +1769,9 @@ static int dev_rw(int wr, uint64_t off, char *buf, size_t len)
 
 	if (counting && !(off % BLK))
 		count_io(wr, off, buf, len);
-	if (!cratio)
+	if (sealed)
+		err = ps_rw(wr, off, buf, len);
+	else if (!cratio)
 		err = vram_rw(wr, off, buf, len) ? EIO : 0;
 	else
 		err = wr ? cs_write(off, buf, len) : cs_read(off, buf, len);
@@ -1749,15 +1870,16 @@ static void *stat_thread(void *arg)
 		fchmod(fileno(f), 0600); /* how many pages share a copy says something about what they hold */
 		if (cratio)
 			fprintf(f, "COMPRESSED=1\nPAGES=%llu\nSTORED_BYTES=%llu\nSEGMENT_BYTES=%llu\nREFUSED=%llu\n"
-				   "SPILLED_BYTES=%llu\nSPILL_BYTES=%llu\nRECORDS=%llu\nWAITS=%llu\n"
-				   "REREAD=%llu\nMENDED=%llu\nUNREADABLE=%llu\n",
+				   "SPILLED_BYTES=%llu\nSPILL_BYTES=%llu\nRECORDS=%llu\nWAITS=%llu\n",
 				(unsigned long long)pages, (unsigned long long)bytes, (unsigned long long)held,
 				(unsigned long long)refused, (unsigned long long)sbytes,
 				(unsigned long long)spill_size, (unsigned long long)recs,
-				(unsigned long long)waits, (unsigned long long)reread,
+				(unsigned long long)waits);
+		if (cratio || sealed)
+			fprintf(f, "REREAD=%llu\nMENDED=%llu\nUNREADABLE=%llu\n", (unsigned long long)reread,
 				(unsigned long long)mended, (unsigned long long)lost);
 		fprintf(f, "VRAM_BYTES=%llu\nCIPHER=%s\nUPTIME=%llu\nSAMPLE=%d\n", (unsigned long long)phys_size,
-			cratio ? cipher_name : "none", (unsigned long long)((now_ns() - started) / 1000000000),
+			cratio || sealed ? cipher_name : "none", (unsigned long long)((now_ns() - started) / 1000000000),
 			SAMPLE);
 		/*
 		 * One line for each kind of operation:
@@ -2217,7 +2339,7 @@ static void *ublk_queue(void *arg)
 
 	cu.CtxSetCurrent(ctx);
 	prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0);
-	if (cratio)
+	if (cratio || sealed)
 		ct_init();
 	ring_init(&ring, 2 * UBLK_DEPTH,
 		  IORING_SETUP_COOP_TASKRUN | IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN);
@@ -2599,6 +2721,44 @@ static void selftest(int threads)
 		x ^= x << 13, x ^= x >> 7, x ^= x << 17;
 		if (vram_rw(0, x % nblk * BLK, pin, BLK))
 			die("selftest: direct read failed");
+	}
+	if (sealed) { /* what is on the card is not the block; one flipped bit is put right, two are refused */
+		static const unsigned spots[] = { REC_HDR + 77, 20, 15, 5, 0, SLOT - 1 };
+		uint64_t blk = nblk / 2, lost = cs.lost;
+		char was[2], bad[2];
+		double worst = 0;
+		fill(a, BLK, 0x5EA1);
+		if (nbd_io(fd, NBD_CMD_WRITE, blk * BLK, a, BLK) || vram_rw(0, blk * SLOT + REC_HDR, b, BLK) ||
+		    !memcmp(a, b, BLK))
+			die("selftest: a block is on the card unencrypted");
+		for (unsigned k = 0; k < sizeof spots / sizeof *spots; k++) {
+			uint64_t at = blk * SLOT + spots[k], before = cs.mended;
+			if (vram_rw(0, at, was, 1))
+				die("selftest: could not read the card");
+			bad[0] = was[0] ^ (1 << (k + 1));
+			t = now();
+			if (vram_rw(1, at, bad, 1) || nbd_io(fd, NBD_CMD_READ, blk * BLK, b, BLK) || memcmp(a, b, BLK))
+				die("selftest: a flipped bit at byte %u of a block was not put right", spots[k]);
+			if (now() - t > worst)
+				worst = now() - t;
+			if (vram_rw(0, at, bad, 1) || bad[0] != was[0] || cs.mended != before + 1)
+				die("selftest: a flipped bit was read past but not mended on the card");
+		}
+		if (vram_rw(0, blk * SLOT + 200, was, 2))
+			die("selftest: could not read the card");
+		bad[0] = was[0] ^ 1, bad[1] = was[1] ^ 0x80;
+		if (vram_rw(1, blk * SLOT + 200, bad, 2) || nbd_io(fd, NBD_CMD_READ, blk * BLK, b, BLK) != EIO ||
+		    cs.lost != lost + 1 || vram_rw(1, blk * SLOT + 200, was, 2) ||
+		    nbd_io(fd, NBD_CMD_READ, blk * BLK, b, BLK) || memcmp(a, b, BLK))
+			die("selftest: an altered block was not refused");
+		/* a block moved to another's place is not that block */
+		if (vram_rw(0, blk * SLOT, b, SLOT) || vram_rw(0, (blk + 1) * SLOT, a, SLOT) ||
+		    vram_rw(1, (blk + 1) * SLOT, b, SLOT) ||
+		    nbd_io(fd, NBD_CMD_READ, (blk + 1) * BLK, b, BLK) != EIO || vram_rw(1, (blk + 1) * SLOT, a, SLOT))
+			die("selftest: a block in the wrong place was not refused");
+		printf("encryption            ok (%s; an altered or misplaced block is refused)\n", cipher_name);
+		printf("repair                ok (one flipped bit is found and put right, in %.0f ms at worst)\n",
+		       worst * 1000);
 	}
 	dr = now() - t;
 	printf("4K random read    %7.0f IOPS  (%.1f us each, direct VRAM copy, no socket)\n",
@@ -3108,6 +3268,8 @@ int main(int argc, char **argv)
 			threads = atoi(v), i++;
 		else if (!strcmp(argv[i], "--compress") && v)
 			cratio = atof(v), i++;
+		else if (!strcmp(argv[i], "--encrypt"))
+			sealed = 1;
 		else if (!strcmp(argv[i], "--zlevel") && v)
 			clevel = atoi(v), i++;
 		else if (!strcmp(argv[i], "--cipher") && v)
@@ -3122,7 +3284,7 @@ int main(int argc, char **argv)
 			low_pct = atoi(v), i++;
 		else
 			die("usage: vroom (--selftest | --dev /dev/nbdN | --dev /dev/ublkbN | --bench DEV)"
-			    " [--size MiB] [--gpu N] [--threads N]"
+			    " [--size MiB] [--gpu N] [--threads N] [--encrypt]"
 			    " [--compress RATIO [--spill FILE [--spill-size MiB]]]");
 	}
 	if (cratio && !(cratio >= 1 && cratio <= 8))
@@ -3177,6 +3339,10 @@ int main(int argc, char **argv)
 	 */
 	if (!test)
 		block_stop_signals();
+	if (getenv("VROOM_ENCRYPT") && atoi(getenv("VROOM_ENCRYPT")))
+		sealed = 1;
+	if (cratio)
+		sealed = 0; /* a compressed device is encrypted anyway, by its own means */
 	if (getenv("VROOM_CIPHER") && *getenv("VROOM_CIPHER"))
 		cipher_name = getenv("VROOM_CIPHER");
 	vram_init(gpu, size_mib);

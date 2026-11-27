@@ -2,3 +2,4 @@ vroom
 vroom@.service
 build/
 *.deb
+vroom-sleep.service

@@ -1,0 +1,24 @@
+[Unit]
+Description=Take vroom swap out of use while the machine sleeps
+# The daemon is frozen with every other program when the machine suspends or
+# hibernates, and the kernel may still want to swap after that: to a device
+# nobody is serving, which hangs the machine. The NVIDIA driver, saving the
+# card's memory, is one thing that asks for memory at just that moment. So
+# before any of it, swap devices are emptied and stopped, which frees their
+# VRAM as well; they are started again, empty, on waking.
+# If one cannot be emptied (no room in RAM and other swap for what it holds),
+# this fails and the machine does not go to sleep, which is better than a
+# machine that does not wake.
+Before=sleep.target nvidia-suspend.service nvidia-hibernate.service nvidia-suspend-then-hibernate.service
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=15min
+TimeoutStopSec=5min
+ExecStart=@SBINDIR@/vroomctl _sleep
+ExecStop=@SBINDIR@/vroomctl _wake
+
+[Install]
+RequiredBy=sleep.target

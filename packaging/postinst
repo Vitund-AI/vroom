@@ -2,6 +2,8 @@
 set -e
 if [ -d /run/systemd/system ]; then
 	systemctl daemon-reload || true
+	# does nothing unless there are swap devices: see the unit
+	systemctl enable vroom-sleep.service >/dev/null 2>&1 || true
 fi
 if [ "$1" = configure ] && [ -z "$2" ]; then
 	echo "vroom: installed. Try 'vroomctl selftest', then e.g."

@@ -121,6 +121,7 @@ One card can be split into several devices, each with its own job:
 sudo vroomctl add swap    --size 5000 --swap --boot
 sudo vroomctl add scratch --size 2048 --mount /mnt/scratch
 sudo vroomctl add blk     --size 512  --raw           # appears as /dev/vroom/blk
+sudo vroomctl add safe    --size 2048 --mount /mnt/safe --encrypt   # encrypted, and checked for bit rot
 ```
 
 ```
@@ -217,7 +218,7 @@ whether keeping a single copy would be worth building.
 
 Limits to know about: it costs about 50 bytes of RAM per page offered
 (12 MiB per GiB), locked in memory, and 32 bytes of VRAM per page stored;
-plain devices are not encrypted; two pages are taken to be identical on
+plain devices are encrypted only if asked (`--encrypt`); two pages are taken to be identical on
 the strength of their fingerprints, without comparing them (for any two
 pages the chance of a false match is below 1 in 2^95, far smaller than
 that of the hardware getting it wrong); the two water marks are fixed, not
@@ -281,11 +282,17 @@ swap: `swapoff /swap.img && swapon /swap.img`.
   right where it lies, in a few tens of milliseconds. More damage than that
   is an I/O error, never wrong data. `vroomctl stats` counts both. None of
   this helps a page that was already wrong in the machine's own memory
-  before it was written, and a plain device has no check at all: it returns
-  whatever the card holds, as a RAM disk on non-ECC memory would.
-- **A plain device holds pages as they are.** Anyone who can read the
-  card's memory can read them. They are wiped when the device is stopped
-  cleanly; use `--compress` if that is not enough, which also encrypts.
+  before it was written. A device that is not compressed gets the same
+  check and repair with `--encrypt`; without it there is no check at all,
+  and it returns whatever the card holds, as a RAM disk on non-ECC memory
+  would.
+- **A plain device holds pages as they are** unless it was added with
+  `--encrypt`. Anyone who can read the card's memory can read them, and
+  they are wiped when the device is stopped cleanly. `--encrypt` stores
+  every 4K block encrypted under a key that exists only in the daemon's
+  memory, with 32 bytes in front of it to check it by: the device is 1/129th
+  smaller than the VRAM it takes, and a little slower. It works for mounted
+  and raw devices as well as swap.
 - **After a driver upgrade, leave devices running until you reboot.** Ubuntu's
   driver packages replace the libraries but leave the old kernel module
   loaded, so a running device carries on unharmed. A device started after
@@ -300,11 +307,18 @@ swap: `swapoff /swap.img && swapon /swap.img`.
   leave them room.
 - **Mounting over a directory in use** (such as a live `/tmp`) hides what is
   already there, including sockets that running programs depend on.
-- **Suspend and hibernate are not handled.** They only work if the driver
-  saves VRAM (`vroomctl list` warns if `PreserveVideoMemoryAllocations` is
-  off), and even then the driver writes the whole device to disk on the way
-  down. Nothing moves the pages off the card first: on a machine that
-  sleeps, `vroomctl stop` the device beforehand, or do not use vroom yet.
+- **Suspend and hibernate: swap is taken away first, and put back after.**
+  Once the machine starts to sleep the daemon is frozen, and anything that
+  then needs to swap would wait on it for ever. So `vroom-sleep.service`
+  (enabled when the first swap device is added) empties and stops every
+  swap device before the machine sleeps and before the NVIDIA driver saves
+  the card, and starts them again, empty, on waking. Emptying needs room
+  in RAM and other swap for what the device holds; if there is none, the
+  machine does not go to sleep, and the journal says why. This has been
+  rehearsed by starting the unit by hand, not yet through a real suspend:
+  treat it as new. Mounted and raw devices cannot be emptied anywhere and
+  are left alone; they survive only if the driver saves VRAM (`vroomctl
+  list` warns if `PreserveVideoMemoryAllocations` is off).
 - **Swapping to a userspace daemon can deadlock under extreme memory
   pressure.** Mitigations in place: `mlockall`, page-locked staging buffers,
   `PR_SET_IO_FLUSHER`, OOM score −1000. Keep disk swap enabled as the
@@ -349,8 +363,8 @@ kernel swap ──► /dev/nbd0   ──► socketpair ──┐
   through OpenCL, so not tied to NVIDIA. The original, and by its own
   README not meant for serious use.
 - [nbd-vram](https://github.com/c0deJedi/nbd-vram): VRAM as swap through the
-  CUDA driver API and NBD, the closest relative. It unhooks the swap before
-  suspend and puts it back afterwards, which vroom does not do yet.
+  CUDA driver API and NBD, the closest relative. It was the first to take the swap away
+  before suspend and put it back afterwards.
 - [nbdkit-vram-plugin](https://libguestfs.org/nbdkit-vram-plugin.1.html):
   an nbdkit plugin over OpenCL, for any GPU with OpenCL.
 
@@ -366,17 +380,15 @@ Ideas, not promises, in the order they are likely to be done:
 1. **Soak the compressed store** on a real workload, and a stress test that
    drives a machine deep into swap to see that the precautions against
    deadlock hold.
-2. **Drain before suspend**, where the driver does not preserve VRAM.
-3. **Give VRAM back when something else wants it.** Watch how much of the
+2. **Give VRAM back when something else wants it.** Watch how much of the
    card other programs are using and, between a high and a low mark, move
    pages to the spill file and release whole 256 MiB allocations, taking
    them back later. It can only keep room free in advance: an allocation by
    another program fails at once, with no chance to make room for it.
-4. **Learn the water marks** for spilling instead of fixing them at 90% and
+3. **Learn the water marks** for spilling instead of fixing them at 90% and
    70%, if real use shows the fixed ones to be wrong.
-5. **Encrypt plain devices too.** Only the compressed store is encrypted.
-6. **GPUs other than NVIDIA's**, through Vulkan or OpenCL.
-7. A `--help` for `vroomctl`, packages other than `.deb`.
+4. **GPUs other than NVIDIA's**, through Vulkan or OpenCL.
+5. A `--help` for `vroomctl`, packages other than `.deb`.
 
 ## License
 
