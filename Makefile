@@ -56,6 +56,7 @@ check: build/vroom-test
 	$(TEST) --size 64 --encrypt >> build/check.log 2>&1 || { tail -20 build/check.log; exit 1; }
 	$(TEST) --size 64 --encrypt --cipher chacha20 --threads 8 >> build/check.log 2>&1 || { tail -20 build/check.log; exit 1; }
 	$(TEST) --size 64 --compress 1.5 >> build/check.log 2>&1 || { tail -20 build/check.log; exit 1; }
+	$(TEST) --size 64 --compress 1.5 --algo lz4 --threads 8 >> build/check.log 2>&1 || { tail -20 build/check.log; exit 1; }
 	$(TEST) --size 64 --compress 2.2 --spill build/check.spill >> build/check.log 2>&1 || { tail -20 build/check.log; exit 1; }
 	$(TEST) --size 48 --compress 3 --spill build/check.spill --spill-size 40 --threads 8 --cipher chacha20 >> build/check.log 2>&1 || { tail -20 build/check.log; exit 1; }
 	@grep -c 'selftest passed' build/check.log | sed 's/$$/ self-tests passed (build\/check.log)/'

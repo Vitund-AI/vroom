@@ -611,16 +611,48 @@ static void crypt_init(void)
 		die("cannot get random bytes for the keys: %s", strerror(errno));
 }
 
+/*
+ * LZ4 in place of zstd (--algo lz4): a page takes about a third of the time
+ * to compress and to expand, and comes out about half as much larger again.
+ * Dressed as the zstd calls, so nothing else need know. The level is LZ4's
+ * "acceleration".
+ */
+static const char *algo = "zstd";
+static int (*lz_fast)(const char *, char *, int, int, int);
+static int (*lz_safe)(const char *, char *, int, int);
+static void *lz_ctx(void) { return &lz_fast; }
+static unsigned lz_err(size_t c) { (void)c; return 0; }
+static size_t lz_comp(void *x, void *dst, size_t cap, const void *src, size_t n, int level)
+{
+	(void)x;
+	return lz_fast(src, dst, n, cap, level > 1 ? level : 1); /* 0: it would not fit */
+}
+static size_t lz_decomp(void *x, void *dst, size_t cap, const void *src, size_t n)
+{
+	(void)x;
+	int r = lz_safe(src, dst, n, cap);
+	return r < 0 ? 0 : r;
+}
+
 static void cs_init(void)
 {
-	void *lib = dlopen("libzstd.so.1", RTLD_NOW), *p;
-	if (!lib)
-		die("--compress needs libzstd.so.1: %s", dlerror());
-	z.CreateCCtx = sym(lib, "ZSTD_createCCtx");
-	z.CreateDCtx = sym(lib, "ZSTD_createDCtx");
-	z.Compress = sym(lib, "ZSTD_compressCCtx");
-	z.Decompress = sym(lib, "ZSTD_decompressDCtx");
-	z.IsError = sym(lib, "ZSTD_isError");
+	void *lib, *p;
+	if (!strcmp(algo, "lz4")) {
+		if (!(lib = dlopen("liblz4.so.1", RTLD_NOW)))
+			die("--algo lz4 needs liblz4.so.1: %s", dlerror());
+		lz_fast = sym(lib, "LZ4_compress_fast");
+		lz_safe = sym(lib, "LZ4_decompress_safe");
+		z.CreateCCtx = z.CreateDCtx = lz_ctx, z.Compress = lz_comp, z.Decompress = lz_decomp, z.IsError = lz_err;
+	} else if (!strcmp(algo, "zstd")) {
+		if (!(lib = dlopen("libzstd.so.1", RTLD_NOW)))
+			die("--compress needs libzstd.so.1: %s", dlerror());
+		z.CreateCCtx = sym(lib, "ZSTD_createCCtx");
+		z.CreateDCtx = sym(lib, "ZSTD_createDCtx");
+		z.Compress = sym(lib, "ZSTD_compressCCtx");
+		z.Decompress = sym(lib, "ZSTD_decompressDCtx");
+		z.IsError = sym(lib, "ZSTD_isError");
+	} else
+		die("--algo is zstd or lz4");
 	crypt_init();
 	/* Nobody outside should be able to make two pages hash alike on purpose. */
 	if (getrandom(&hash_secret, sizeof hash_secret, 0) != sizeof hash_secret)
@@ -3563,6 +3595,8 @@ int main(int argc, char **argv)
 			cratio = atof(v), i++;
 		else if (!strcmp(argv[i], "--encrypt"))
 			sealed = 1;
+		else if (!strcmp(argv[i], "--algo") && v)
+			algo = v, i++;
 		else if (!strcmp(argv[i], "--zlevel") && v)
 			clevel = atoi(v), i++;
 		else if (!strcmp(argv[i], "--cipher") && v)
@@ -3637,6 +3671,10 @@ int main(int argc, char **argv)
 		sealed = 1;
 	if (cratio)
 		sealed = 0; /* a compressed device is encrypted anyway, by its own means */
+	if (getenv("VROOM_ALGO") && *getenv("VROOM_ALGO"))
+		algo = getenv("VROOM_ALGO");
+	if (getenv("VROOM_ZLEVEL") && *getenv("VROOM_ZLEVEL"))
+		clevel = atoi(getenv("VROOM_ZLEVEL"));
 	if (getenv("VROOM_CIPHER") && *getenv("VROOM_CIPHER"))
 		cipher_name = getenv("VROOM_CIPHER");
 	vram_init(gpu, size_mib);

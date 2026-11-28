@@ -192,6 +192,26 @@ def be_vroom_old(a):  # compressed, the old way
     return be_vroom_plain_old(a, None)
 
 
+def be_vroom_env(a, *env):  # compressed, with these settings added to the daemon's own
+    dev, undo = be_vroom(a)
+    with open("/etc/vroom/swapbench.conf", "a") as f:
+        f.write("\n".join(env) + "\n")
+    sh("systemctl", "restart", "vroom@swapbench.service", quiet=True)
+    return dev, undo
+
+
+def be_vroom_zfast1(a):
+    return be_vroom_env(a, "VROOM_ZLEVEL=-1")
+
+
+def be_vroom_zfast5(a):
+    return be_vroom_env(a, "VROOM_ZLEVEL=-5")
+
+
+def be_vroom_lz4(a):
+    return be_vroom_env(a, "VROOM_ALGO=lz4")
+
+
 def be_vroom_enc(a):  # the same, with each block encrypted and checked
     return be_vroom(a, ["--encrypt"])
 
@@ -213,7 +233,8 @@ def be_vroom_x4(a):  # four compressed devices
 
 
 BACKENDS = {"none": be_none, "ssd": be_ssd, "ssd-dev": be_ssd_dev, "zswap": be_zswap, "zram": be_zram,
-            "vroom": be_vroom, "vroom-old": be_vroom_old, "vroom-plain": be_vroom_plain, "vroom-plain-old": be_vroom_plain_old,
+            "vroom": be_vroom, "vroom-z-1": be_vroom_zfast1, "vroom-z-5": be_vroom_zfast5,
+            "vroom-lz4": be_vroom_lz4, "vroom-old": be_vroom_old, "vroom-plain": be_vroom_plain, "vroom-plain-old": be_vroom_plain_old,
             "vroom-plain-nice": be_vroom_plain_nice, "vroom-plain-rt": be_vroom_plain_rt,
             "vroom-plain-q4-rt": be_vroom_plain_q4_rt,
             "vroom-enc": be_vroom_enc,
