@@ -446,6 +446,7 @@ static struct {
 	uint8_t *state;
 	uint64_t *seq;	 /* when it was opened, for finding the oldest */
 	uint16_t *pins;	 /* readers at work in a spill segment, which must not be rewritten meanwhile */
+	uint32_t *busy;	 /* copies on their way out of a segment of the card: see cs_read_send */
 	uint8_t *hits;	 /* reads in a row that each went a little further into a spill segment */
 	uint32_t *lastoff; /* where in the segment the last of them ended */
 	uint64_t *touched; /* a spill segment: when it was last read from */
@@ -487,7 +488,10 @@ static __thread struct {
 	void *cc, *dc, *seal, *open, *print;
 	char *stage;
 	char *fix, *work; /* for rescue(): a record as it was read, and a copy to try things on */
+	CUstream stream; /* this thread's own line of copies to wait on */
+	int streamed;
 } ct;
+static int no_batch; /* VROOM_NO_BATCH: every copy waited for by itself, as it used to be */
 
 static int page_print(const char *page, struct fp *f);
 static int rec_crypt(int seal, struct rec *r, char *data);
@@ -501,6 +505,7 @@ static void ct_init(void)
 	if (cu.MemAllocHost(&p, sz) && posix_memalign(&p, BLK, sz))
 		die("cannot allocate staging buffer");
 	ct.stage = p;
+	ct.streamed = !no_batch && !cu.StreamCreate(&ct.stream, 1);
 	if (posix_memalign(&p, BLK, 6 * BLK))
 		die("cannot allocate staging buffer");
 	ct.fix = memset(p, 0, 6 * BLK), ct.work = ct.fix + 3 * BLK;
@@ -707,6 +712,7 @@ static void cs_init(void)
 	cs.used = calloc(all, sizeof *cs.used);
 	cs.seq = calloc(all, sizeof *cs.seq);
 	cs.pins = calloc(all, sizeof *cs.pins);
+	cs.busy = calloc(all, sizeof *cs.busy);
 	cs.hits = calloc(all, 1);
 	cs.touched = calloc(all, sizeof *cs.touched);
 	cs.lastoff = calloc(all, sizeof *cs.lastoff);
@@ -924,7 +930,22 @@ static int log_append(const char *buf, size_t bytes)
 			cs.state[s] = SEG_CLOSED;
 			if (!cs.live[s])
 				seg_free(s);
-			cs.open = s = cs.freelist[--cs.nfree];
+			/*
+			 * Not one that a read is still copying out of. Whoever is
+			 * doing so finishes without needing the lock we hold, and
+			 * in microseconds, so if every free one is taken, wait.
+			 */
+			uint32_t k;
+			for (;;) {
+				for (k = cs.nfree; k && __atomic_load_n(&cs.busy[cs.freelist[k - 1]], __ATOMIC_ACQUIRE); k--)
+					;
+				if (k)
+					break;
+				sched_yield();
+			}
+			s = cs.freelist[k - 1];
+			cs.freelist[k - 1] = cs.freelist[--cs.nfree];
+			cs.open = s;
 			cs.state[s] = SEG_OPEN;
 			cs.seq[s] = ++cs.clock;
 			continue;
@@ -1470,6 +1491,119 @@ static int rescue(uint64_t lpn, char *p)
 	return err ? EIO : 0;
 }
 
+static int rescue(uint64_t lpn, char *p);
+
+/* Records as they were stored, in stage: check each, open it, and put the page it holds in buf. */
+static int cs_unpack(uint64_t lpn, size_t n, char *buf, char *stage, const uint32_t *pos, const uint32_t *clen,
+		     const uint32_t *non)
+{
+	for (size_t i = 0; i < n; i++) {
+		char *p = buf + i * BLK, *data = stage + pos[i];
+		struct rec r;
+
+		if (!clen[i]) {
+			memset(p, 0, BLK);
+			continue;
+		}
+		memcpy(&r, data - REC_HDR, sizeof r);
+		/*
+		 * The nonce must be the one this page was last sealed with: a
+		 * record can be genuine and still be the wrong one, an older
+		 * writing of the same page put back by a failing disk or by
+		 * someone who can write to it.
+		 */
+		if (r.len != clen[i] || (uint32_t)r.nonce != non[i] || rec_crypt(0, &r, data)) {
+			if (rescue(lpn + i, p))
+				return EIO;
+			continue;
+		}
+		if (r.len == BLK)
+			memcpy(p, data, BLK);
+		else if (z.Decompress(ct.dc, p, BLK, data, r.len) != BLK) {
+			if (say())
+				fprintf(stderr, "vroom: stored page %llu does not decompress\n",
+					(unsigned long long)(lpn + i));
+			return EIO;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Reading in two steps, so that many reads can share one wait for the card.
+ * cs_read_send asks for the copies and returns at once; when the stream has
+ * been waited for, cs_read_done turns what arrived into pages.
+ *
+ * Between the two the lock is not held, and what was asked for may be
+ * overwritten, discarded or moved. None of that changes the bytes where they
+ * lie; only a segment emptied and then written afresh would, so each segment
+ * being copied from is marked busy, and log_append does not take a busy one.
+ *
+ * Returns -1, having asked for nothing, if any of it is in the spill file.
+ */
+#define SEND_PAGES 64
+struct sent_read {
+	uint64_t lpn;
+	uint32_t n, nseg, bad;
+	uint64_t t0, bytes; /* for the timing: from the asking until it has all arrived */
+	uint32_t pos[SEND_PAGES], clen[SEND_PAGES], non[SEND_PAGES], seg[2 * SEND_PAGES];
+};
+
+static int cs_read_send(struct sent_read *sr, uint64_t off, size_t len, char *stage, CUstream stream)
+{
+	uint64_t lpn = off / BLK;
+	size_t n = len / BLK, in = 0;
+
+	if (off % BLK || len % BLK || n > SEND_PAGES)
+		return -1;
+	*sr = (struct sent_read){ .lpn = lpn, .n = n };
+	pthread_mutex_lock(&cs.lock);
+	for (size_t i = 0; i < n; i++)
+		if (cs.map[lpn + i] && E_OFF(cs.rloc[cs.map[lpn + i]]) >= phys_size) {
+			pthread_mutex_unlock(&cs.lock);
+			return -1;
+		}
+	for (size_t i = 0; i < n;) {
+		uint64_t e = cs.rloc[cs.map[lpn + i]], start, end;
+		if (!e) {
+			sr->clen[i++] = 0;
+			continue;
+		}
+		/* as cs_read: every following page whose record comes straight after, in one copy */
+		start = E_OFF(e), end = start;
+		do {
+			sr->pos[i] = in + (end - start) + REC_HDR;
+			sr->clen[i] = E_LEN(e);
+			sr->non[i] = cs.rnon[cs.map[lpn + i]];
+			cs.rhot[cs.map[lpn + i]] = 1;
+			end += REC_HDR + E_LEN(e);
+		} while (++i < n && (e = cs.rloc[cs.map[lpn + i]]) && E_OFF(e) == end && end != phys_size);
+		for (uint32_t g = start / SEG; g <= (end - 1) / SEG; g++) {
+			__atomic_add_fetch(&cs.busy[g], 1, __ATOMIC_RELEASE);
+			sr->seg[sr->nseg++] = g;
+		}
+		if (vram_send(0, start, stage + in, end - start, stream))
+			sr->bad = 1;
+		in += end - start;
+	}
+	pthread_mutex_unlock(&cs.lock);
+	if ((sr->bytes = in))
+		sr->t0 = perf_begin(P_VRAM_READ, in);
+	return 0;
+}
+
+/* Once the stream has been waited for; failed says that the wait reported an error. */
+static int cs_read_done(struct sent_read *sr, char *buf, char *stage, int failed)
+{
+	for (uint32_t k = 0; k < sr->nseg; k++)
+		__atomic_sub_fetch(&cs.busy[sr->seg[k]], 1, __ATOMIC_RELEASE);
+	if (sr->bad || failed)
+		return EIO;
+	if (sr->bytes)
+		perf_end(P_VRAM_READ, sr->bytes, sr->t0);
+	return cs_unpack(sr->lpn, sr->n, buf, stage, sr->pos, sr->clen, sr->non);
+}
+
 static int cs_read(uint64_t off, char *buf, size_t len)
 {
 	uint64_t lpn = off / BLK;
@@ -1487,6 +1621,11 @@ static int cs_read(uint64_t off, char *buf, size_t len)
 	if (off % BLK || len % BLK || n > MAX_PAGES)
 		return EINVAL;
 	ct_init();
+	if (ct.streamed && n <= SEND_PAGES) { /* all on the card, as it nearly always is: without holding the lock */
+		struct sent_read sr;
+		if (!cs_read_send(&sr, off, len, ct.stage, ct.stream))
+			return cs_read_done(&sr, buf, ct.stage, cu.StreamSynchronize(ct.stream));
+	}
 	pthread_mutex_lock(&cs.lock);
 	for (size_t i = 0; i < n && !bad;) {
 		uint64_t e = cs.rloc[cs.map[lpn + i]], start, end;
@@ -1586,36 +1725,7 @@ static int cs_read(uint64_t off, char *buf, size_t len)
 	}
 	if (bad)
 		return EIO;
-	for (size_t i = 0; i < n; i++) {
-		char *p = buf + i * BLK, *data = ct.stage + pos[i];
-		struct rec r;
-
-		if (!clen[i]) {
-			memset(p, 0, BLK);
-			continue;
-		}
-		memcpy(&r, data - REC_HDR, sizeof r);
-		/*
-		 * The nonce must be the one this page was last sealed with: a
-		 * record can be genuine and still be the wrong one, an older
-		 * writing of the same page put back by a failing disk or by
-		 * someone who can write to it.
-		 */
-		if (r.len != clen[i] || (uint32_t)r.nonce != non[i] || rec_crypt(0, &r, data)) {
-			if (rescue(lpn + i, p))
-				return EIO;
-			continue;
-		}
-		if (r.len == BLK)
-			memcpy(p, data, BLK);
-		else if (z.Decompress(ct.dc, p, BLK, data, r.len) != BLK) {
-			if (say())
-				fprintf(stderr, "vroom: stored page %llu does not decompress\n",
-					(unsigned long long)(lpn + i));
-			return EIO;
-		}
-	}
-	return 0;
+	return cs_unpack(lpn, n, buf, ct.stage, pos, clen, non);
 }
 
 /*
@@ -2423,10 +2533,13 @@ static void *ublk_queue(void *arg)
 		unsigned tag;
 		int res, wr;
 		uint64_t t_req, t_vram;
+		struct sent_read *sr;
 	} sent[UBLK_DEPTH];
 	unsigned nsent = 0;
 	CUstream stream = NULL;
-	int together = !cratio && !sealed && !getenv("VROOM_NO_BATCH");
+	int together = !sealed && !no_batch;
+	struct sent_read *sr = NULL; /* compressed: what each read in the batch asked for, and where it landed */
+	char *stage[UBLK_DEPTH];
 
 	cu.CtxSetCurrent(ctx);
 	prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0);
@@ -2457,6 +2570,17 @@ static void *ublk_queue(void *arg)
 	}
 	if (together && cu.StreamCreate(&stream, 1)) /* 1: a stream of its own, not in step with the default one */
 		together = 0;
+	if (together && cratio) {
+		sr = calloc(UBLK_DEPTH, sizeof *sr);
+		for (int tag = 0; tag < UBLK_DEPTH && sr; tag++) {
+			void *p;
+			if (cu.MemAllocHost(&p, SEND_PAGES * (BLK + REC_HDR)))
+				sr = NULL;
+			stage[tag] = p;
+		}
+		if (!sr)
+			together = 0;
+	}
 	if (handoff) {
 		pthread_mutex_init(&qdone[q].lock, NULL);
 		qdone[q].efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -2506,6 +2630,14 @@ static void *ublk_queue(void *arg)
 			const struct ublksrv_io_desc *d = &iod[tag];
 			uint64_t off = d->start_sector << 9, len = (uint64_t)d->nr_sectors << 9;
 			int res;
+			if (together && cratio && (d->op_flags & 0xff) == UBLK_IO_OP_READ && len <= ublk_io_bytes &&
+			    off + len <= dev_size && !cs_read_send(&sr[tag], off, len, stage[tag], stream)) {
+				sent[nsent++] = (typeof(sent[0])){ .tag = tag, .t_req = perf_begin(P_REQ_READ, len),
+								   .sr = &sr[tag] };
+				if (counting && !(off % BLK))
+					count_io(0, off, buf[tag], len);
+				continue; /* answered below, with the others */
+			}
 			if (handoff && len <= ublk_io_bytes && off + len <= dev_size &&
 			    (is_write || ((d->op_flags & 0xff) == UBLK_IO_OP_READ && cs_reads_spill(off, len)))) {
 				struct slow *j = &slow[tag];
@@ -2526,7 +2658,7 @@ static void *ublk_queue(void *arg)
 			case UBLK_IO_OP_WRITE:
 				if (len > ublk_io_bytes || off + len > dev_size)
 					res = -EINVAL;
-				else if (together) {
+				else if (together && !cratio) {
 					int kr = is_write ? P_REQ_WRITE : P_REQ_READ, kv = is_write ? P_VRAM_WRITE : P_VRAM_READ;
 					sent[nsent] = (typeof(sent[0])){ .tag = tag, .wr = is_write, .res = len,
 									 .t_req = perf_begin(kr, len),
@@ -2564,7 +2696,10 @@ static void *ublk_queue(void *arg)
 			for (unsigned i = 0; i < nsent; i++) {
 				const struct ublksrv_io_desc *d = &iod[sent[i].tag];
 				size_t len = (size_t)d->nr_sectors << 9;
-				if (r)
+				if (sent[i].sr) {
+					int err = cs_read_done(sent[i].sr, buf[sent[i].tag], stage[sent[i].tag], r);
+					sent[i].res = err ? -err : (int)len;
+				} else if (r)
 					sent[i].res = -EIO;
 				perf_end(sent[i].wr ? P_VRAM_WRITE : P_VRAM_READ, len, sent[i].t_vram);
 				perf_end(sent[i].wr ? P_REQ_WRITE : P_REQ_READ, len, sent[i].t_req);
@@ -2975,6 +3110,8 @@ static void cs_check(const char *when)
 		sl[E_OFF(e) / SEG] += REC_HDR + E_LEN(e);
 	}
 	for (uint32_t s = 0; s < cs.nseg + cs.nspill; s++) {
+		if (cs.busy[s])
+			bad = "a segment is still marked as being read";
 		if (sl[s] != cs.live[s])
 			bad = "a segment's count of live bytes is wrong";
 		if (cs.live[s] && cs.state[s] == SEG_FREE)
@@ -3495,6 +3632,7 @@ int main(int argc, char **argv)
 	 */
 	if (!test)
 		block_stop_signals();
+	no_batch = getenv("VROOM_NO_BATCH") != NULL;
 	if (getenv("VROOM_ENCRYPT") && atoi(getenv("VROOM_ENCRYPT")))
 		sealed = 1;
 	if (cratio)
