@@ -373,12 +373,20 @@ static int vram_send(int wr, uint64_t off, char *buf, size_t len, CUstream s)
 #define E_LEN(e) ((uint32_t)((e) >> 40) & 0x1fff)
 #define E_MAKE(off, len) (E_VALID | (uint64_t)(len) << 40 | (off))
 #define IDX_GONE UINT32_MAX
+/*
+ * A record written as it came, to be compressed later: see cs_write_send.
+ * E_FRESH marks it in the tables and R_FRESH in its own header, which goes
+ * where it goes.
+ */
+#define E_FRESH (1ULL << 53)
+#define R_FRESH 1
+#define RAWREC ((size_t)REC_HDR + BLK)
 /* SEG_BAD: its record headers no longer add up; what is in it can be read but is never moved. */
 enum { SEG_FREE, SEG_OPEN, SEG_CLOSED, SEG_CLEANING, SEG_BAD };
 
 struct rec {
 	uint32_t id; /* which record this is: see cs.rloc */
-	uint16_t len, pad;
+	uint16_t len, pad; /* pad: R_FRESH, or 0 */
 	uint64_t nonce;	 /* never used twice in the life of the key */
 	uint8_t tag[16]; /* proves the data, the id and the length are what was stored */
 };
@@ -447,6 +455,8 @@ static struct {
 	uint64_t *seq;	 /* when it was opened, for finding the oldest */
 	uint16_t *pins;	 /* readers at work in a spill segment, which must not be rewritten meanwhile */
 	uint32_t *busy;	 /* copies on their way out of a segment of the card: see cs_read_send */
+	uint32_t *coming; /* records given a place in it whose bytes are still on their way: see cs_write_send */
+	uint32_t *fresh; /* bytes of live records in it that are still to be compressed */
 	uint8_t *hits;	 /* reads in a row that each went a little further into a spill segment */
 	uint32_t *lastoff; /* where in the segment the last of them ended */
 	uint64_t *touched; /* a spill segment: when it was last read from */
@@ -465,10 +475,13 @@ static struct {
 	int stuck;		   /* the keeper can free nothing more: the store is full */
 	int waiting;		   /* writes waiting for room */
 	uint32_t ahead;		   /* free segments the keeper tries to keep in hand */
+	uint32_t spare;		   /* and how many it would like, so that writes need not be compressed first */
 	uint64_t waits;		   /* writes that had to wait for it */
 	uint32_t *freelist, nseg, nfree, open;
 	uint32_t *sfree, nspill, nsfree; /* spill segments are numbered nseg onwards */
-	char *gcbuf, *evbuf, *rebuf;
+	char *gcbuf, *evbuf, *rebuf, *sqbuf;
+	uint64_t freshb;   /* bytes on the card still to be compressed */
+	uint64_t deferred, squeezed, inlined; /* pages: written as they came; compressed since; compressed on arrival */
 	uint64_t clock;
 	uint64_t pages, recs, bytes, sbytes; /* pages held, the records behind them, their bytes, and how much of that is spilled */
 	uint64_t cleaned, refused, evicted, returned, spared;
@@ -492,6 +505,8 @@ static __thread struct {
 	int streamed;
 } ct;
 static int no_batch; /* VROOM_NO_BATCH: every copy waited for by itself, as it used to be */
+static int defer = 1; /* write pages as they come and compress them afterwards; VROOM_NO_DEFER: on arrival */
+static int squeeze_pct = 50; /* ...once the card is this full: what is soon gone is never compressed at all */
 
 static int page_print(const char *page, struct fp *f);
 static int rec_crypt(int seal, struct rec *r, char *data);
@@ -745,6 +760,8 @@ static void cs_init(void)
 	cs.seq = calloc(all, sizeof *cs.seq);
 	cs.pins = calloc(all, sizeof *cs.pins);
 	cs.busy = calloc(all, sizeof *cs.busy);
+	cs.coming = calloc(all, sizeof *cs.coming);
+	cs.fresh = calloc(all, sizeof *cs.fresh);
 	cs.hits = calloc(all, 1);
 	cs.touched = calloc(all, sizeof *cs.touched);
 	cs.lastoff = calloc(all, sizeof *cs.lastoff);
@@ -765,6 +782,11 @@ static void cs_init(void)
 	if (cu.MemAllocHost(&p, SEG) && posix_memalign(&p, BLK, SEG))
 		p = NULL;
 	cs.rebuf = p;
+	if (cu.MemAllocHost(&p, SEG + BLK) && posix_memalign(&p, BLK, SEG + BLK))
+		p = NULL;
+	cs.sqbuf = p;
+	if (!cs.coming || !cs.fresh || !cs.sqbuf || !cs.busy)
+		die("out of memory for the compressed store's tables");
 	if (!cs.map || !cs.rloc || !cs.rfp || !cs.rref || !cs.rnon || !cs.idx || !cs.live || !cs.used || !cs.seq ||
 	    !cs.pins || !cs.hits || !cs.lastoff || !cs.state || !cs.freelist || !cs.sfree || !cs.gcbuf || !cs.evbuf || !cs.rebuf)
 		die("out of memory for the compressed store's tables");
@@ -779,6 +801,7 @@ static void cs_init(void)
 	cs.state[0] = SEG_OPEN;
 	cs.seq[0] = ++cs.clock;
 	cs.ahead = cs.nseg / 32 < 4 ? 4 : cs.nseg / 32 > 64 ? 64 : cs.nseg / 32;
+	cs.spare = cs.nseg / 8 > 2 * cs.ahead ? cs.nseg / 8 : 2 * cs.ahead;
 	spawn(keeper_thread, NULL, NULL);
 }
 
@@ -826,12 +849,20 @@ static void loc_account(uint64_t e, int add)
 		cs.live[s] += sz;
 		if (s >= cs.nseg)
 			cs.sbytes += sz;
+		else if (e & E_FRESH)
+			cs.freshb += sz;
+		if (e & E_FRESH)
+			cs.fresh[s] += sz;
 		return;
 	}
 	cs.bytes -= sz;
 	cs.live[s] -= sz;
 	if (s >= cs.nseg)
 		cs.sbytes -= sz;
+	else if (e & E_FRESH)
+		cs.freshb -= sz;
+	if (e & E_FRESH)
+		cs.fresh[s] -= sz;
 	cs.stuck = 0; /* something has died: there may be room to be made again */
 	if (!cs.live[s] && (cs.state[s] == SEG_CLOSED || cs.state[s] == SEG_BAD))
 		seg_free(s);
@@ -942,6 +973,36 @@ static void map_set(uint64_t lpn, uint32_t id)
 	cs.pages++;
 }
 
+/* The open segment is full: close it and open a free one. */
+static int log_next(void)
+{
+	uint32_t s = cs.open, k;
+
+	if (!cs.nfree)
+		return ENOSPC;
+	cs.state[s] = SEG_CLOSED;
+	if (!cs.live[s])
+		seg_free(s);
+	/*
+	 * Not one that a read is still copying out of. Whoever is doing so
+	 * finishes without needing the lock we hold, and in microseconds, so
+	 * if every free one is taken, wait.
+	 */
+	for (;;) {
+		for (k = cs.nfree; k && __atomic_load_n(&cs.busy[cs.freelist[k - 1]], __ATOMIC_ACQUIRE); k--)
+			;
+		if (k)
+			break;
+		sched_yield();
+	}
+	s = cs.freelist[k - 1];
+	cs.freelist[k - 1] = cs.freelist[--cs.nfree];
+	cs.open = s;
+	cs.state[s] = SEG_OPEN;
+	cs.seq[s] = ++cs.clock;
+	return 0;
+}
+
 /* Append records (header, data, header, data...) to the log and note where each now is. */
 static int log_append(const char *buf, size_t bytes)
 {
@@ -957,37 +1018,29 @@ static int log_append(const char *buf, size_t bytes)
 			n += REC_HDR + r.len;
 		}
 		if (!n) { /* this segment is full: move to a free one */
-			if (!cs.nfree)
+			if (log_next())
 				return ENOSPC;
-			cs.state[s] = SEG_CLOSED;
-			if (!cs.live[s])
-				seg_free(s);
-			/*
-			 * Not one that a read is still copying out of. Whoever is
-			 * doing so finishes without needing the lock we hold, and
-			 * in microseconds, so if every free one is taken, wait.
-			 */
-			uint32_t k;
-			for (;;) {
-				for (k = cs.nfree; k && __atomic_load_n(&cs.busy[cs.freelist[k - 1]], __ATOMIC_ACQUIRE); k--)
-					;
-				if (k)
-					break;
-				sched_yield();
-			}
-			s = cs.freelist[k - 1];
-			cs.freelist[k - 1] = cs.freelist[--cs.nfree];
-			cs.open = s;
-			cs.state[s] = SEG_OPEN;
-			cs.seq[s] = ++cs.clock;
 			continue;
 		}
 		uint64_t at = (uint64_t)s * SEG + cs.used[s];
-		if (vram_rw(1, at, (char *)buf, n))
+		/*
+		 * The records must be on the card before the tables say so, for
+		 * every thread and not only this one. A plain copy does not
+		 * promise that: the driver may take a small one from ordinary
+		 * memory and return before it has been done, and a read on
+		 * another thread's stream can then get in first. A copy on our
+		 * own stream, waited for, is done when the wait returns.
+		 */
+		if (ct.streamed) {
+			uint64_t t0 = perf_begin(P_VRAM_WRITE, n);
+			if (vram_send(1, at, (char *)buf, n, ct.stream) | (cu.StreamSynchronize(ct.stream) != 0))
+				return EIO;
+			perf_end(P_VRAM_WRITE, n, t0);
+		} else if (vram_rw(1, at, (char *)buf, n))
 			return EIO;
 		for (size_t pos = 0; pos < n; pos += REC_HDR + r.len) {
 			memcpy(&r, buf + pos, sizeof r);
-			rec_place(r.id, E_MAKE(at + pos, r.len));
+			rec_place(r.id, E_MAKE(at + pos, r.len) | (r.pad & R_FRESH ? E_FRESH : 0));
 			cs.rnon[r.id] = (uint32_t)r.nonce;
 		}
 		cs.used[s] += n;
@@ -1004,6 +1057,7 @@ static int log_append(const char *buf, size_t bytes)
 static uint64_t moved_from[SEG / (REC_HDR + 1) + 1]; /* by evict: where each record it is moving was */
 static size_t nmoved;
 static int ev_force;	/* evict: take records whether they have been read or not */
+static int sv_track;	/* squeeze_one: it wants to know where each was, too */
 static uint32_t ev_kept; /* how many it left behind in the segment it was last given */
 
 static size_t survivors(const char *src, uint32_t v, char *dst, size_t out, size_t limit, int *all)
@@ -1046,7 +1100,7 @@ static size_t survivors(const char *src, uint32_t v, char *dst, size_t out, size
 		}
 		memmove(dst + out, src + pos, REC_HDR + r.len);
 		out += REC_HDR + r.len;
-		if (dst == cs.evbuf)
+		if (dst == cs.evbuf || sv_track)
 			moved_from[nmoved++] = (uint64_t)v * SEG + pos;
 	}
 	return out;
@@ -1132,7 +1186,8 @@ static int evict(void)
 		uint64_t oldest = UINT64_MAX;
 		v = 0;
 		for (uint32_t s = 0; s < cs.nseg; s++)
-			if (cs.state[s] == SEG_CLOSED && cs.seq[s] > floor && cs.seq[s] <= stop && cs.seq[s] < oldest)
+			if (cs.state[s] == SEG_CLOSED && cs.seq[s] > floor && cs.seq[s] <= stop && cs.seq[s] < oldest &&
+			    !cs.coming[s])
 				oldest = cs.seq[s], v = s;
 		/*
 		 * Room has to be made all the same. If a good many segments have
@@ -1193,7 +1248,7 @@ static int evict(void)
 		 */
 		if (!cs.rloc[r.id] || E_OFF(cs.rloc[r.id]) != moved_from[k] || cs.rnon[r.id] != (uint32_t)r.nonce)
 			continue;
-		rec_place(r.id, E_MAKE((uint64_t)slot * SEG + pos, r.len));
+		rec_place(r.id, E_MAKE((uint64_t)slot * SEG + pos, r.len) | (r.pad & R_FRESH ? E_FRESH : 0));
 		went += REC_HDR + r.len;
 	}
 	cs.used[slot] = out;
@@ -1208,16 +1263,16 @@ static int evict(void)
 	return 0;
 }
 
-/* Empty the closed segment holding the least live data. Fails if none would give much back. */
-static int clean_one(void)
+/* Empty the closed segment holding the least live data. Fails if none holds as little as `most`. */
+static int clean_one(uint32_t most)
 {
 	uint32_t v = 0, best = UINT32_MAX;
 	size_t out = 0;
 
 	for (uint32_t s = 0; s < cs.nseg; s++)
-		if (cs.state[s] == SEG_CLOSED && cs.live[s] < best)
+		if (cs.state[s] == SEG_CLOSED && cs.live[s] < best && !cs.coming[s])
 			best = cs.live[s], v = s;
-	if (best > SEG - SEG / 16)
+	if (best > most)
 		return ENOSPC;
 	if (vram_rw(0, (uint64_t)v * SEG, cs.gcbuf, cs.used[v]))
 		return EIO;
@@ -1236,6 +1291,101 @@ static int clean_one(void)
 	seg_free(v);
 	cs.cleaned++;
 	return 0;
+}
+
+/*
+ * Compress what was written as it came. A write to a device that compresses
+ * is answered as soon as the page is sealed and on the card (cs_write_send);
+ * the compressing, which is nine tenths of the work, is done here, afterwards
+ * and by one thread, a segment at a time: read it, compress its fresh records
+ * with the lock dropped, and append the lot to the log as cleaning would. A
+ * record that went away or was written again meanwhile is simply not moved.
+ * The segments with the most to gain go first, and of those the oldest, whose
+ * pages have shown they are staying.
+ */
+static uint32_t sq_non[SEG / (REC_HDR + 1) + 1];
+static uint8_t sq_how[SEG / (REC_HDR + 1) + 1];
+
+static int squeeze_one(void)
+{
+	enum { KEPT_AS_IS, DONE, FAILED };
+	uint32_t v = 0, best = 0;
+	uint64_t age = UINT64_MAX;
+	struct rec r, w;
+	size_t in, out = 0, k = 0, keep = 0, did = 0;
+
+	for (uint32_t s = 0; s < cs.nseg; s++) {
+		uint32_t gain = cs.fresh[s] < SEG / 2 ? cs.fresh[s] : SEG / 2;
+		if (cs.state[s] == SEG_CLOSED && !cs.coming[s] && gain &&
+		    (gain > best || (gain == best && cs.seq[s] < age)))
+			best = gain, age = cs.seq[s], v = s;
+	}
+	if (!best)
+		return ENOSPC;
+	if (vram_rw(0, (uint64_t)v * SEG, cs.gcbuf, cs.used[v]))
+		return EIO;
+	nmoved = 0, sv_track = 1;
+	in = survivors(cs.gcbuf, v, cs.gcbuf, 0, SEG, NULL);
+	sv_track = 0;
+	if (cs.state[v] == SEG_BAD)
+		return 0; /* left where it is, and not to be looked at again */
+	cs.state[v] = SEG_CLEANING; /* nothing frees it or writes to it while the lock is dropped */
+	pthread_mutex_unlock(&cs.lock);
+	for (size_t pos = 0; pos < in; pos += REC_HDR + r.len, k++) {
+		char *data = cs.gcbuf + pos + REC_HDR, *o = cs.sqbuf + out;
+		memcpy(&r, cs.gcbuf + pos, sizeof r);
+		sq_non[k] = (uint32_t)r.nonce;
+		if (!(r.pad & R_FRESH) || r.len != BLK) {
+			memcpy(o, cs.gcbuf + pos, REC_HDR + r.len);
+			out += REC_HDR + r.len;
+			sq_how[k] = KEPT_AS_IS;
+			continue;
+		}
+		sq_how[k] = FAILED;
+		w = r;
+		if (rec_crypt(0, &w, data)) /* rotten: whoever reads it will find out, and mend it if it can be */
+			continue;
+		size_t c = z.Compress(ct.cc, o + REC_HDR, RAW_ABOVE, data, BLK, clevel);
+		if (z.IsError(c) || !c || c > RAW_ABOVE) {
+			memcpy(o + REC_HDR, data, BLK);
+			c = BLK;
+		}
+		w = (struct rec){ .id = r.id, .len = c };
+		if (rec_crypt(1, &w, o + REC_HDR))
+			continue;
+		memcpy(o, &w, sizeof w);
+		out += REC_HDR + c;
+		sq_how[k] = DONE;
+	}
+	pthread_mutex_lock(&cs.lock);
+	k = 0, out = 0;
+	for (size_t pos = 0; pos < in; pos += REC_HDR + r.len, k++) {
+		memcpy(&r, cs.gcbuf + pos, sizeof r);
+		uint64_t e = cs.rloc[r.id];
+		int here = e && E_OFF(e) == moved_from[k] && cs.rnon[r.id] == sq_non[k];
+		if (sq_how[k] == FAILED) {
+			if (here && (e & E_FRESH)) { /* not to be tried again */
+				cs.rloc[r.id] = e & ~E_FRESH;
+				cs.fresh[v] -= REC_HDR + E_LEN(e);
+				cs.freshb -= REC_HDR + E_LEN(e);
+			}
+			continue;
+		}
+		memcpy(&w, cs.sqbuf + out, sizeof w);
+		if (here) {
+			memmove(cs.sqbuf + keep, cs.sqbuf + out, REC_HDR + w.len);
+			keep += REC_HDR + w.len;
+			did += sq_how[k] == DONE;
+		}
+		out += REC_HDR + w.len;
+	}
+	int err = log_append(cs.sqbuf, keep);
+	cs.state[v] = SEG_CLOSED;
+	if (!cs.live[v])
+		seg_free(v);
+	if (!err)
+		cs.squeezed += did;
+	return err;
 }
 
 /* Bring a spilled segment back onto the card: the one most recently read from, or else spilled. */
@@ -1279,17 +1429,34 @@ static void *keeper_thread(void *arg)
 	(void)arg;
 	cu.CtxSetCurrent(ctx);
 	prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0);
+	ct_init();
 	pthread_mutex_lock(&cs.lock);
 	for (;;) {
 		uint64_t on_card = cs.bytes - cs.sbytes;
 		int spill = spill_fd >= 0, err = EAGAIN;
 
 		if (spill && on_card * 100 > phys_size * high_pct) {
-			if ((err = evict()) && cs.nfree < cs.ahead)
-				err = clean_one(); /* the spill is full, or failing: at least tidy up */
+			/* compressing what is here makes room without troubling the disk */
+			if ((err = squeeze_one()) && (err = evict()) && cs.nfree < cs.ahead)
+				err = clean_one(SEG - SEG / 16); /* the spill is full, or failing: at least tidy up */
 		} else if (cs.nfree < cs.ahead) {
-			if ((err = clean_one()))
+			/* a segment that is half dead is the cheapest room; then one that can be compressed */
+			if ((err = clean_one(SEG / 2)) && (err = squeeze_one()) && (err = clean_one(SEG - SEG / 16)))
 				err = evict();
+		} else if (defer && cs.nfree < cs.spare) {
+			/*
+			 * Not short, but writes are answered uncompressed only while
+			 * there are segments to spare: win some back, cheaply.
+			 */
+			if (clean_one(SEG / 2) && squeeze_one())
+				err = EAGAIN;
+			else
+				err = 0;
+		} else if (cs.freshb && on_card * 100 > phys_size * squeeze_pct) {
+			if (squeeze_one())
+				err = EAGAIN;
+			else
+				err = 0;
 		} else if (spill && cs.sbytes && on_card * 100 < phys_size * low_pct && cs.nfree >= 4) {
 			rehydrate();
 			err = 0;
@@ -1354,6 +1521,151 @@ static int page_is_zero(const char *p)
 	return !w && !memcmp(p, p + 8, BLK - 8);
 }
 
+/*
+ * Writing in two steps, as reading is (cs_read_send), and without
+ * compressing: each new page is sealed as it is, given a place in the log,
+ * and its copy to the card asked for. When the stream has been waited for,
+ * cs_write_done points the pages at their records and the write can be
+ * answered; the keeper compresses the records later (squeeze_one), if they
+ * live long enough to be worth it. A write therefore costs a queue about
+ * what it costs on a device that does not compress, and no helper thread.
+ *
+ * Between the two steps the records have their room, counted in their
+ * segment as live so that nothing frees it, but nothing points at them yet;
+ * the segment is marked as having records coming, and the keeper, which
+ * believes what it reads from the card, leaves such a segment alone.
+ *
+ * Returns -1, having done nothing, when free segments are running short:
+ * raw pages take room faster than the keeper can win it back, and the write
+ * is then compressed on arrival (cs_write), as they all used to be.
+ */
+#define SEND_PAGES 64
+struct sent_write {
+	uint64_t lpn;
+	uint32_t n, fresh;
+	int err;
+	uint32_t id[SEND_PAGES], non[SEND_PAGES];
+	uint64_t at[SEND_PAGES];
+	uint8_t kind[SEND_PAGES];
+};
+enum { W_ZERO, W_SHARED, W_NEW };
+
+static int cs_write_send(struct sent_write *sw, uint64_t off, const char *buf, size_t len, char *stage,
+			 CUstream stream)
+{
+	uint64_t lpn = off / BLK;
+	struct fp print[SEND_PAGES];
+	size_t n = len / BLK, out = 0, run = 0;
+
+	if (!defer || off % BLK || len % BLK || n > SEND_PAGES ||
+	    __atomic_load_n(&cs.nfree, __ATOMIC_RELAXED) <= cs.ahead)
+		return -1;
+	*sw = (struct sent_write){ .lpn = lpn, .n = n };
+	for (size_t i = 0; i < n; i++) {
+		sw->kind[i] = page_is_zero(buf + i * BLK) ? W_ZERO : W_NEW;
+		if (sw->kind[i] == W_NEW && page_print(buf + i * BLK, &print[i]))
+			return -1;
+	}
+	pthread_mutex_lock(&cs.lock);
+	if (cs.nfree <= cs.ahead) { /* the keeper is behind */
+		pthread_cond_signal(&cs.wake);
+		pthread_mutex_unlock(&cs.lock);
+		return -1;
+	}
+	for (size_t i = 0; i < n; i++) {
+		uint32_t r;
+		if (sw->kind[i] != W_NEW)
+			continue;
+		r = idx_find(&print[i]);
+		for (size_t j = 0; j < i && !r; j++) /* or one arriving in this same request */
+			if (sw->kind[j] == W_NEW && print[j].a == print[i].a && print[j].b == print[i].b)
+				r = sw->id[j];
+		if (r && cs.rref[r] != UINT32_MAX) {
+			cs.rref[r]++;
+			sw->id[i] = r;
+			sw->kind[i] = W_SHARED;
+		} else if (!(sw->id[i] = rec_alloc(&print[i]))) {
+			for (size_t j = 0; j < i; j++)
+				if (sw->id[j])
+					rec_unref(sw->id[j]);
+			pthread_mutex_unlock(&cs.lock);
+			return -1;
+		}
+	}
+	for (size_t i = 0; i < n; i++) {
+		if (sw->kind[i] != W_NEW)
+			continue;
+		if (SEG - cs.used[cs.open] < RAWREC)
+			log_next(); /* cannot fail: there are free segments in hand */
+		uint32_t s = cs.open;
+		sw->at[i] = (uint64_t)s * SEG + cs.used[s];
+		cs.used[s] += RAWREC;
+		cs.coming[s]++;
+		loc_account(E_MAKE(sw->at[i], BLK) | E_FRESH, 1); /* room spoken for: see cs_write_done */
+		sw->fresh++;
+	}
+	if (cs.nfree < cs.spare || (cs.bytes - cs.sbytes) * 100 > phys_size * squeeze_pct)
+		pthread_cond_signal(&cs.wake);
+	pthread_mutex_unlock(&cs.lock);
+
+	for (size_t i = 0; i < n; i++) {
+		char *o = stage + out;
+		struct rec r = { .id = sw->id[i], .len = BLK, .pad = R_FRESH };
+		if (sw->kind[i] != W_NEW)
+			continue;
+		memcpy(o + REC_HDR, buf + i * BLK, BLK);
+		if (rec_crypt(1, &r, o + REC_HDR))
+			sw->err = EIO;
+		memcpy(o, &r, sizeof r);
+		sw->non[i] = (uint32_t)r.nonce;
+		out += RAWREC;
+		/* records that lie one after the other on the card go in one copy */
+		size_t nx = i + 1;
+		while (nx < n && sw->kind[nx] != W_NEW)
+			nx++;
+		if (nx < n && sw->at[nx] == sw->at[i] + RAWREC)
+			continue;
+		if (vram_send(1, sw->at[i] + RAWREC - (out - run), stage + run, out - run, stream))
+			sw->err = EIO;
+		run = out;
+	}
+	return 0;
+}
+
+/* Once the stream has been waited for; failed says that the wait reported an error. */
+static int cs_write_done(struct sent_write *sw, int failed)
+{
+	int err = failed ? EIO : sw->err;
+
+	pthread_mutex_lock(&cs.lock);
+	if (!err)
+		idx_reserve(sw->fresh);
+	for (size_t i = 0; i < sw->n; i++) {
+		uint32_t id = sw->id[i];
+		if (sw->kind[i] == W_NEW) {
+			uint64_t e = E_MAKE(sw->at[i], BLK) | E_FRESH;
+			cs.coming[sw->at[i] / SEG]--;
+			if (!err) {
+				rec_place(id, e); /* before the room spoken for is given up, or the segment might go */
+				cs.rnon[id] = sw->non[i];
+				idx_insert(id);
+			}
+			loc_account(e, 0);
+		}
+		if (sw->kind[i] == W_ZERO) {
+			if (!err)
+				map_drop(sw->lpn + i);
+		} else if (err)
+			rec_unref(id);
+		else
+			map_set(sw->lpn + i, id);
+	}
+	if (!err)
+		cs.deferred += sw->fresh;
+	pthread_mutex_unlock(&cs.lock);
+	return err;
+}
+
 static int cs_write(uint64_t off, const char *buf, size_t len)
 {
 	enum { ZERO, SHARED, NEW };
@@ -1367,6 +1679,11 @@ static int cs_write(uint64_t off, const char *buf, size_t len)
 	if (off % BLK || len % BLK || n > MAX_PAGES)
 		return EINVAL;
 	ct_init();
+	if (ct.streamed && n <= SEND_PAGES) { /* the quick way, if there is room for it */
+		struct sent_write sw;
+		if (!cs_write_send(&sw, off, buf, len, ct.stage, ct.stream))
+			return cs_write_done(&sw, cu.StreamSynchronize(ct.stream));
+	}
 	for (size_t i = 0; i < n; i++) {
 		kind[i] = page_is_zero(buf + i * BLK) ? ZERO : NEW;
 		if (kind[i] == NEW) {
@@ -1417,6 +1734,8 @@ static int cs_write(uint64_t off, const char *buf, size_t len)
 		idx_reserve(fresh);
 		err = log_append(ct.stage, out);
 	}
+	if (!err)
+		cs.inlined += fresh;
 	for (size_t i = 0; i < n; i++) {
 		if (kind[i] == ZERO) {
 			if (!err)
@@ -1573,7 +1892,6 @@ static int cs_unpack(uint64_t lpn, size_t n, char *buf, char *stage, const uint3
  *
  * Returns -1, having asked for nothing, if any of it is in the spill file.
  */
-#define SEND_PAGES 64
 struct sent_read {
 	uint64_t lpn;
 	uint32_t n, nseg, bad;
@@ -2063,7 +2381,8 @@ static void *stat_thread(void *arg)
 	for (unsigned tick = 0;; tick++, sleep(TICK)) {
 		pthread_mutex_lock(&cs.lock);
 		uint64_t pages = cs.pages, bytes = cs.bytes - cs.sbytes, refused = cs.refused, sbytes = cs.sbytes;
-		uint64_t spared = cs.spared;
+		uint64_t spared = cs.spared, freshb = cs.freshb, deferred = cs.deferred, squeezed = cs.squeezed;
+		uint64_t inlined = cs.inlined;
 		uint64_t recs = cs.recs, waits = cs.waits, reread = cs.reread, mended = cs.mended, lost = cs.lost;
 		uint64_t held = (uint64_t)(cs.nseg - cs.nfree) * SEG;
 		pthread_mutex_unlock(&cs.lock);
@@ -2091,11 +2410,13 @@ static void *stat_thread(void *arg)
 		fchmod(fileno(f), 0600); /* how many pages share a copy says something about what they hold */
 		if (cratio)
 			fprintf(f, "COMPRESSED=1\nPAGES=%llu\nSTORED_BYTES=%llu\nSEGMENT_BYTES=%llu\nREFUSED=%llu\n"
-				   "SPILLED_BYTES=%llu\nSPILL_BYTES=%llu\nRECORDS=%llu\nWAITS=%llu\nSPARED=%llu\n",
+				   "SPILLED_BYTES=%llu\nSPILL_BYTES=%llu\nRECORDS=%llu\nWAITS=%llu\nSPARED=%llu\n"
+				   "UNCOMPRESSED_BYTES=%llu\nWRITTEN_RAW=%llu\nCOMPRESSED_LATER=%llu\nCOMPRESSED_AT_ONCE=%llu\n",
 				(unsigned long long)pages, (unsigned long long)bytes, (unsigned long long)held,
 				(unsigned long long)refused, (unsigned long long)sbytes,
 				(unsigned long long)spill_size, (unsigned long long)recs,
-				(unsigned long long)waits, (unsigned long long)spared);
+				(unsigned long long)waits, (unsigned long long)spared, (unsigned long long)freshb,
+				(unsigned long long)deferred, (unsigned long long)squeezed, (unsigned long long)inlined);
 		if (cratio || sealed)
 			fprintf(f, "REREAD=%llu\nMENDED=%llu\nUNREADABLE=%llu\n", (unsigned long long)reread,
 				(unsigned long long)mended, (unsigned long long)lost);
@@ -2566,11 +2887,13 @@ static void *ublk_queue(void *arg)
 		int res, wr;
 		uint64_t t_req, t_vram;
 		struct sent_read *sr;
+		struct sent_write *sw;
 	} sent[UBLK_DEPTH];
 	unsigned nsent = 0;
 	CUstream stream = NULL;
 	int together = !sealed && !no_batch;
 	struct sent_read *sr = NULL; /* compressed: what each read in the batch asked for, and where it landed */
+	struct sent_write *sw = NULL; /* and each write */
 	char *stage[UBLK_DEPTH];
 
 	cu.CtxSetCurrent(ctx);
@@ -2604,6 +2927,9 @@ static void *ublk_queue(void *arg)
 		together = 0;
 	if (together && cratio) {
 		sr = calloc(UBLK_DEPTH, sizeof *sr);
+		sw = calloc(UBLK_DEPTH, sizeof *sw);
+		if (!sw)
+			sr = NULL;
 		for (int tag = 0; tag < UBLK_DEPTH && sr; tag++) {
 			void *p;
 			if (cu.MemAllocHost(&p, SEND_PAGES * (BLK + REC_HDR)))
@@ -2626,12 +2952,23 @@ static void *ublk_queue(void *arg)
 			die("ublk: io_uring_enter: %s", strerror(-r));
 		unsigned first = *ring.cq_head, tail = __atomic_load_n(ring.cq_tail, __ATOMIC_ACQUIRE), head;
 		/* Everything that has arrived, twice over: reads and the rest first, then the writes. */
-		for (int writes = 0; writes < 2; writes++)
+		/*
+		 * Which of them are writes is settled now, once: when the reads
+		 * have been answered their tags may come back at any moment
+		 * describing other requests, which belong to the next round.
+		 */
+		uint64_t wmask = 0;
+		for (head = first; head != tail; head++) {
+			struct io_uring_cqe *e = &ring.cqes[head & *ring.cq_mask];
+			if (e->user_data != POLL_UD && e->res == UBLK_IO_RES_OK &&
+			    (iod[e->user_data].op_flags & 0xff) == UBLK_IO_OP_WRITE)
+				wmask |= 1ULL << e->user_data;
+		}
+		for (int writes = 0; writes < 2; writes++) {
 		for (head = first; head != tail; head++) {
 			struct io_uring_cqe *e = &ring.cqes[head & *ring.cq_mask];
 			unsigned tag = e->user_data;
-			int is_write = e->user_data != POLL_UD && e->res == UBLK_IO_RES_OK &&
-				       (iod[tag].op_flags & 0xff) == UBLK_IO_OP_WRITE;
+			int is_write = e->user_data != POLL_UD && (wmask >> tag & 1);
 			if (is_write != writes)
 				continue;
 			if (e->user_data == POLL_UD) { /* helpers have finished some requests */
@@ -2653,9 +2990,15 @@ static void *ublk_queue(void *arg)
 				continue;
 			}
 			if (e->res != UBLK_IO_RES_OK) { /* device stopping: no re-fetch */
+				/*
+				 * Anything else is the kernel refusing what we sent, which
+				 * means we have lost track of a request. Going on would
+				 * leave requests that nobody will ever answer, and a device
+				 * that cannot then be stopped; the kernel fails them all
+				 * cleanly when the process goes.
+				 */
 				if (e->res != UBLK_IO_RES_ABORT)
-					fprintf(stderr, "vroom: ublk queue %d tag %u: %s\n", q, tag,
-						strerror(-e->res));
+					die("ublk queue %d tag %u: %s", q, tag, strerror(-e->res));
 				live--;
 				continue;
 			}
@@ -2668,6 +3011,14 @@ static void *ublk_queue(void *arg)
 								   .sr = &sr[tag] };
 				if (counting && !(off % BLK))
 					count_io(0, off, buf[tag], len);
+				continue; /* answered below, with the others */
+			}
+			if (together && cratio && is_write && len <= ublk_io_bytes && off + len <= dev_size &&
+			    !cs_write_send(&sw[tag], off, buf[tag], len, stage[tag], stream)) {
+				sent[nsent++] = (typeof(sent[0])){ .tag = tag, .wr = 1, .t_req = perf_begin(P_REQ_WRITE, len),
+								   .t_vram = perf_begin(P_VRAM_WRITE, len), .sw = &sw[tag] };
+				if (counting && !(off % BLK))
+					count_io(1, off, buf[tag], len);
 				continue; /* answered below, with the others */
 			}
 			if (handoff && len <= ublk_io_bytes && off + len <= dev_size &&
@@ -2722,7 +3073,12 @@ static void *ublk_queue(void *arg)
 						    .addr = (uintptr_t)buf[tag] };
 			ring_cmd(&ring, cdev_fd, UBLK_U_IO_COMMIT_AND_FETCH_REQ, &c, sizeof c, tag);
 		}
-		if (nsent) {
+		/*
+		 * Sealing a batch of writes takes a compressed device some time,
+		 * and a read is what somebody is stopped waiting for: the reads
+		 * are answered before the writes are begun.
+		 */
+		if (nsent && (writes || (cratio && wmask))) {
 			if ((r = cu.StreamSynchronize(stream)) && say())
 				fprintf(stderr, "vroom: VRAM copies failed (CUDA error %d)\n", r);
 			for (unsigned i = 0; i < nsent; i++) {
@@ -2730,6 +3086,9 @@ static void *ublk_queue(void *arg)
 				size_t len = (size_t)d->nr_sectors << 9;
 				if (sent[i].sr) {
 					int err = cs_read_done(sent[i].sr, buf[sent[i].tag], stage[sent[i].tag], r);
+					sent[i].res = err ? -err : (int)len;
+				} else if (sent[i].sw) {
+					int err = cs_write_done(sent[i].sw, r);
 					sent[i].res = err ? -err : (int)len;
 				} else if (r)
 					sent[i].res = -EIO;
@@ -2740,6 +3099,9 @@ static void *ublk_queue(void *arg)
 				ring_cmd(&ring, cdev_fd, UBLK_U_IO_COMMIT_AND_FETCH_REQ, &c, sizeof c, sent[i].tag);
 			}
 			nsent = 0;
+			if (!writes && (r = ring_enter(&ring, 0)))
+				die("ublk: io_uring_enter: %s", strerror(-r));
+		}
 		}
 		__atomic_store_n(ring.cq_head, head, __ATOMIC_RELEASE);
 	}
@@ -3110,8 +3472,10 @@ static void cs_check(const char *when)
 {
 	uint64_t npages = dev_size / BLK, live = 0, slive = 0, placed = 0, indexed = 0, pages = 0, unused = 0;
 	uint32_t *refs = calloc(cs.rmax + 1, sizeof *refs), *sl = calloc(cs.nseg + cs.nspill, sizeof *sl);
+	uint32_t *sf = calloc(cs.nseg + cs.nspill, sizeof *sf);
 	uint8_t *seen = calloc(cs.rmax + 1, 1);
 	const char *bad = NULL;
+	uint64_t fresh = 0;
 
 	pthread_mutex_lock(&cs.lock);
 	for (uint64_t p = 0; p < npages; p++)
@@ -3140,10 +3504,18 @@ static void cs_check(const char *when)
 		if (!seen[id])
 			bad = "a record is missing from the index";
 		sl[E_OFF(e) / SEG] += REC_HDR + E_LEN(e);
+		if (e & E_FRESH)
+			sf[E_OFF(e) / SEG] += REC_HDR + E_LEN(e);
 	}
 	for (uint32_t s = 0; s < cs.nseg + cs.nspill; s++) {
 		if (cs.busy[s])
 			bad = "a segment is still marked as being read";
+		if (cs.coming[s])
+			bad = "a segment is still marked as having records on their way";
+		if (sf[s] != cs.fresh[s])
+			bad = "a segment's count of bytes to be compressed is wrong";
+		if (s < cs.nseg)
+			fresh += sf[s];
 		if (sl[s] != cs.live[s])
 			bad = "a segment's count of live bytes is wrong";
 		if (cs.live[s] && cs.state[s] == SEG_FREE)
@@ -3155,6 +3527,8 @@ static void cs_check(const char *when)
 	for (uint32_t id = cs.rfree; id; id = cs.rref[id])
 		if (++unused > cs.rmax)
 			break;
+	if (!bad && fresh != cs.freshb)
+		bad = "the total of bytes to be compressed is wrong";
 	if (!bad && (live != cs.bytes || slive != cs.sbytes))
 		bad = "the totals of bytes held are wrong";
 	if (!bad && (placed != cs.recs || indexed != placed || pages != cs.pages))
@@ -3272,6 +3646,42 @@ static void selftest_compress(int threads)
 	t = now();
 	check_all(fd, "in sequential read");
 	printf("sequential read   %7.0f MiB/s  (verified)\n", dev_size / MiB / (now() - t));
+
+	/*
+	 * Writes small enough to be answered before they are compressed: they
+	 * must read back from the start, be compressed by the keeper afterwards,
+	 * and survive being written again while it is at work on them.
+	 */
+	{
+		uint64_t part = npages / 8 & ~63ULL, raw0 = cs.deferred, sq0 = cs.squeezed, before, after;
+		int pct = squeeze_pct;
+		squeeze_pct = 100;
+		for (uint64_t b = 0; b < part; b += 64)
+			if (put_pages(fd, b, 64, 1))
+				die("selftest: write failed at block %llu", (unsigned long long)b);
+		check_all(fd, "written but not yet compressed");
+		before = cs.bytes;
+		if (spill_fd < 0 && (cs.deferred == raw0 || !cs.freshb))
+			die("selftest: small writes were not put off to be compressed later");
+		squeeze_pct = 0;
+		for (uint64_t b = 0; b < part / 2; b += 64) /* half of them again, under the keeper's feet */
+			if (put_pages(fd, b, 64, 1))
+				die("selftest: write failed at block %llu", (unsigned long long)b);
+		pthread_cond_signal(&cs.wake);
+		for (int i = 0; __atomic_load_n(&cs.freshb, __ATOMIC_RELAXED); i++) {
+			if (i == 20000)
+				die("selftest: the keeper did not compress what was written raw");
+			usleep(1000);
+		}
+		squeeze_pct = pct;
+		after = cs.bytes;
+		check_all(fd, "compressed after it was written");
+		if (spill_fd < 0 && (cs.squeezed == sq0 || after >= before))
+			die("selftest: compressing later did not make anything smaller");
+		printf("compress later        ok (%llu pages answered raw; %llu MiB became %llu MiB)\n",
+		       (unsigned long long)(cs.deferred - raw0), (unsigned long long)(before / MiB),
+		       (unsigned long long)(after / MiB));
+	}
 
 	/* What is on the card must not be the page, and altering it must be noticed, not returned. */
 	for (uint64_t b = 0; b < npages; b++) {
@@ -3667,6 +4077,9 @@ int main(int argc, char **argv)
 	if (!test)
 		block_stop_signals();
 	no_batch = getenv("VROOM_NO_BATCH") != NULL;
+	defer = getenv("VROOM_NO_DEFER") == NULL;
+	if (getenv("VROOM_SQUEEZE_PCT") && *getenv("VROOM_SQUEEZE_PCT"))
+		squeeze_pct = atoi(getenv("VROOM_SQUEEZE_PCT"));
 	if (getenv("VROOM_ENCRYPT") && atoi(getenv("VROOM_ENCRYPT")))
 		sealed = 1;
 	if (cratio)

@@ -212,6 +212,10 @@ def be_vroom_lz4(a):
     return be_vroom_env(a, "VROOM_ALGO=lz4")
 
 
+def be_vroom_now(a):  # compressed on arrival, as every write used to be, and not afterwards
+    return be_vroom_env(a, "VROOM_NO_DEFER=1")
+
+
 def be_vroom_enc(a):  # the same, with each block encrypted and checked
     return be_vroom(a, ["--encrypt"])
 
@@ -234,7 +238,7 @@ def be_vroom_x4(a):  # four compressed devices
 
 BACKENDS = {"none": be_none, "ssd": be_ssd, "ssd-dev": be_ssd_dev, "zswap": be_zswap, "zram": be_zram,
             "vroom": be_vroom, "vroom-z-1": be_vroom_zfast1, "vroom-z-5": be_vroom_zfast5,
-            "vroom-lz4": be_vroom_lz4, "vroom-old": be_vroom_old, "vroom-plain": be_vroom_plain, "vroom-plain-old": be_vroom_plain_old,
+            "vroom-lz4": be_vroom_lz4, "vroom-now": be_vroom_now, "vroom-old": be_vroom_old, "vroom-plain": be_vroom_plain, "vroom-plain-old": be_vroom_plain_old,
             "vroom-plain-nice": be_vroom_plain_nice, "vroom-plain-rt": be_vroom_plain_rt,
             "vroom-plain-q4-rt": be_vroom_plain_q4_rt,
             "vroom-enc": be_vroom_enc,

@@ -377,6 +377,8 @@ stats)
 				printf "\n  %-12s %d%% full\n", "VRAM", b * 100 / v["VRAM_BYTES"]
 				if (p > 0 && v["RECORDS"] > 0)
 					printf "  %-12s %.1f%% of pages are a copy of another\n", "sharing", (p - v["RECORDS"]) * 100 / p
+				if ("WRITTEN_RAW" in v && v["WRITTEN_RAW"] + v["COMPRESSED_AT_ONCE"] > 0)
+					printf "  %-12s %s of pages are waiting to be compressed; %d%% of writes were answered first and compressed later, if at all\n", "compressing", size(v["UNCOMPRESSED_BYTES"] * 4096 / 4128), v["WRITTEN_RAW"] * 100 / (v["WRITTEN_RAW"] + v["COMPRESSED_AT_ONCE"])
 				if ("WAITS" in v)
 					printf "  %-12s %s writes have had to wait for room on the card\n", "housekeeping", (v["WAITS"] > 0 ? count(v["WAITS"]) : "no")
 				if (v["SPILL_BYTES"] > 0 && "SPARED" in v)

@@ -166,7 +166,18 @@ nothing readable is left on the card or in a spill file afterwards, and a
 stored page that has been altered, or put back as it was at an earlier
 writing, is refused instead of returned.
 `--cipher chacha20` uses ChaCha20-Poly1305, for a CPU without AES
-instructions. A
+instructions.
+
+A write does not wait to be compressed. The page is encrypted as it is, put
+on the card and the write answered; one background thread compresses such
+pages afterwards, once free room on the card runs below an eighth or the
+card is half full, and a page that has been overwritten or discarded by then
+is never compressed at all. Only when writes arrive faster than that thread
+can win room back are they compressed on arrival, as they would otherwise
+all have to be. `vroomctl stats` says how much is waiting and what share of
+writes went which way.
+
+A
 sample of real swap from a host running several VMs compressed 2.2x, and one
 page in eight written there was a copy of another. `vroomctl list` shows the
 ratio being achieved and how full the card is.
