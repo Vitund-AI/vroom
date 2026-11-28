@@ -175,7 +175,8 @@ card is half full, and a page that has been overwritten or discarded by then
 is never compressed at all. Only when writes arrive faster than that thread
 can win room back are they compressed on arrival, as they would otherwise
 all have to be. `vroomctl stats` says how much is waiting and what share of
-writes went which way.
+writes went which way. A device with `--spill` still compresses every page on
+arrival.
 
 A
 sample of real swap from a host running several VMs compressed 2.2x, and one

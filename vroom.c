@@ -674,6 +674,13 @@ static void cs_init(void)
 		hash_secret = (uint64_t)time(NULL) * 0x9E3779B97F4A7C15ULL ^ (uintptr_t)&lib;
 
 	cs.nseg = phys_size / SEG;
+	/*
+	 * Not with a spill: which records go to the disk first depends on the
+	 * order they were written in, and compressing them later rewrites them.
+	 * There every page is compressed on arrival, as before.
+	 */
+	if (spill_path)
+		defer = 0;
 	if (spill_path) {
 		/*
 		 * The spill can be a file, which is made here and removed at the end,
@@ -1436,27 +1443,20 @@ static void *keeper_thread(void *arg)
 		int spill = spill_fd >= 0, err = EAGAIN;
 
 		if (spill && on_card * 100 > phys_size * high_pct) {
-			/* compressing what is here makes room without troubling the disk */
-			if ((err = squeeze_one()) && (err = evict()) && cs.nfree < cs.ahead)
+			if ((err = evict()) && cs.nfree < cs.ahead)
 				err = clean_one(SEG - SEG / 16); /* the spill is full, or failing: at least tidy up */
 		} else if (cs.nfree < cs.ahead) {
 			/* a segment that is half dead is the cheapest room; then one that can be compressed */
 			if ((err = clean_one(SEG / 2)) && (err = squeeze_one()) && (err = clean_one(SEG - SEG / 16)))
 				err = evict();
-		} else if (defer && cs.nfree < cs.spare) {
+		} else if (defer && cs.nfree < cs.spare && (!clean_one(SEG / 2) || !squeeze_one())) {
 			/*
 			 * Not short, but writes are answered uncompressed only while
-			 * there are segments to spare: win some back, cheaply.
+			 * there are segments to spare: some have been won back, cheaply.
 			 */
-			if (clean_one(SEG / 2) && squeeze_one())
-				err = EAGAIN;
-			else
-				err = 0;
-		} else if (cs.freshb && on_card * 100 > phys_size * squeeze_pct) {
-			if (squeeze_one())
-				err = EAGAIN;
-			else
-				err = 0;
+			err = 0;
+		} else if (cs.freshb && on_card * 100 > phys_size * squeeze_pct && !squeeze_one()) {
+			err = 0;
 		} else if (spill && cs.sbytes && on_card * 100 < phys_size * low_pct && cs.nfree >= 4) {
 			rehydrate();
 			err = 0;
@@ -3652,7 +3652,7 @@ static void selftest_compress(int threads)
 	 * must read back from the start, be compressed by the keeper afterwards,
 	 * and survive being written again while it is at work on them.
 	 */
-	{
+	if (defer) {
 		uint64_t part = npages / 8 & ~63ULL, raw0 = cs.deferred, sq0 = cs.squeezed, before, after;
 		int pct = squeeze_pct;
 		squeeze_pct = 100;
@@ -3668,7 +3668,13 @@ static void selftest_compress(int threads)
 			if (put_pages(fd, b, 64, 1))
 				die("selftest: write failed at block %llu", (unsigned long long)b);
 		pthread_cond_signal(&cs.wake);
-		for (int i = 0; __atomic_load_n(&cs.freshb, __ATOMIC_RELAXED); i++) {
+		for (int i = 0;; i++) { /* all but what is in the segment still being written to */
+			uint64_t left;
+			pthread_mutex_lock(&cs.lock);
+			left = cs.freshb - cs.fresh[cs.open];
+			pthread_mutex_unlock(&cs.lock);
+			if (!left)
+				break;
 			if (i == 20000)
 				die("selftest: the keeper did not compress what was written raw");
 			usleep(1000);
